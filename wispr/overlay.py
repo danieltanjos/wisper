@@ -311,6 +311,7 @@ _SPIN_R = 8
 _IDLE_W = 36
 _IDLE_H = 6
 _ANIM_FRAMES = 8      # ~260 ms de transicao de tamanho entre modos
+_SLIDE_FRAMES = 12    # ~0,4 s: entra subindo de baixo da tela (rapido -> freia), sai ao contrario
 
 _LABEL_WORK = "transcrevendo…"
 _TICK_MS = 33
@@ -430,6 +431,7 @@ class Overlay:
         self._lay_key = None
         self._geom = None
         self._anim = None     # (frame0, w0, h0, w1, h1) durante a transicao de tamanho
+        self._slide = None    # (frame0, +1 entrando | -1 saindo) durante o deslize vertical
         self._scale = 1.0
         self._dpi = 96
         self._sw = 1920
@@ -820,12 +822,34 @@ class Overlay:
         g = self._geom
         if g:
             x, y, w, h = g
-            _u32.SetWindowPos(wt.HWND(hwnd), wt.HWND(HWND_TOPMOST), x, y, w, h,
+            if self._slide is not None:
+                y = self._slide_y()[0]         # entra ja' de baixo, nunca "pisca" no lugar
+            _u32.SetWindowPos(wt.HWND(hwnd), wt.HWND(HWND_TOPMOST), x, int(round(y)), w, h,
                               SWP_NOACTIVATE)
         else:
             _u32.SetWindowPos(wt.HWND(hwnd), wt.HWND(HWND_TOPMOST), 0, 0, 0, 0,
                               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         self._vis = True
+
+    def _slide_y(self) -> tuple[float, bool]:
+        """(y da janela neste quadro do deslize, acabou?). Só com `_slide` ativo."""
+        f0, direction = self._slide
+        x, y, w, h = self._geom
+        t = min(1.0, (self._frame - f0) / float(_SLIDE_FRAMES))
+        below = max(0, self._sh - y)              # distância até sumir sob a base da tela
+        if direction > 0:
+            dy = below * (1.0 - t) ** 3           # entrando: rápido, depois freia
+        else:
+            dy = below * t ** 3                   # saindo: lento, depois acelera
+        return y + dy, t >= 1.0
+
+    def _tk_move(self, y: float) -> None:
+        hwnd = self._hwnd
+        if not hwnd or not self._geom:
+            return
+        x, _y, w, h = self._geom
+        _u32.SetWindowPos(wt.HWND(hwnd), wt.HWND(HWND_TOPMOST), x, int(round(y)), w, h,
+                          SWP_NOACTIVATE)
 
     def _tk_tick(self) -> None:
         """Único lugar do processo que toca em Tk. Roda a 33 ms (~30 fps)."""
@@ -857,7 +881,10 @@ class Overlay:
             if want and mode == "msg":
                 until = st["msg_until"]
                 if until and time.monotonic() > until:
-                    want = False
+                    # Mensagem expirou: volta ao traço ocioso, sem escrever no
+                    # dict (o tick só lê). Sem traço, some.
+                    mode = "idle" if self._idle else ""
+                    want = self._idle
 
             if want:
                 text = _LABEL_WORK if mode == "work" else (st["text"] if mode == "msg" else "")
@@ -886,11 +913,21 @@ class Overlay:
                 self._anim = None
 
             if want and not self._vis:
+                self._slide = (self._frame, +1)
                 self._tk_reveal()
-            elif not want and self._vis:
-                self._hide_now()
+            elif not want and self._vis and (self._slide is None or self._slide[1] > 0):
+                self._slide = (self._frame, -1)   # desce antes de sumir
 
-            if self._vis and self._anim is None:
+            if self._slide is not None and self._vis:
+                y, done = self._slide_y()
+                self._tk_move(y)
+                if done:
+                    entering = self._slide[1] > 0
+                    self._slide = None
+                    if not entering:
+                        self._hide_now()
+
+            if self._vis and self._anim is None and self._slide is None:
                 if mode == "rec":
                     self._tk_anim_bars(st)
                 elif mode == "work":
