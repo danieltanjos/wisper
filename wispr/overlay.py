@@ -556,6 +556,13 @@ class Overlay:
 
             mode = _set_dpi_awareness()
             log.info("overlay dpi awareness=%s", mode)
+            try:
+                # O timer do Windows tem 15,6 ms de resolucao por padrao: um
+                # after(16) vira 16 ou 31 ms ao acaso e o quadro "gagueja".
+                # 1 ms so' para este processo; o SO reverte quando ele sai.
+                ctypes.WinDLL("winmm").timeBeginPeriod(1)
+            except Exception:
+                log.debug("timeBeginPeriod(1) falhou", exc_info=True)
 
             self._tkmod = tk
             root = tk.Tk()
