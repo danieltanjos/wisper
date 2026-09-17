@@ -977,7 +977,8 @@ class App:
         self.log.info("recording started (session %d)", sid)
         self.overlay.show_recording()
         self._tray_state(_STATE_RECORDING)
-        self.ping_start()
+        # Sem bip no inicio (pedido do usuario): a pilula aparecendo ja avisa.
+        # Enter e erro continuam soando.
         self._arm_watchdog(sid)
         try:
             threading.Thread(target=self._level_loop, args=(sid,), name="level",
