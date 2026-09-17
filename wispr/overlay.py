@@ -289,7 +289,7 @@ _NBARS = 11
 _BAR_W = 3
 _BAR_GAP = 3
 _FONT_PX = 11
-_SPIN_R = 7
+_SPIN_R = 9
 _IDLE_W = 44
 _IDLE_H = 8
 
@@ -687,6 +687,9 @@ class Overlay:
 
         if mode == "idle":
             W = self._idle_w
+        elif mode == "work":
+            # Enter: a pilula encolhe na horizontal e fica so' a rodinha.
+            W = H + 2 * self._spin_r
         else:
             inner = tw if mode == "msg" else self._bars_w
             W = max(self._base_w, inner + 2 * r)
@@ -710,7 +713,13 @@ class Overlay:
             cv.create_rectangle(r, b, W - r, H - b, fill=fill, outline="")
 
         cy = H / 2.0
-        if mode in ("rec", "work"):
+        if mode == "work":
+            rs = self._spin_r
+            gx = W / 2.0 - rs
+            self._arc = cv.create_arc(gx, cy - rs, gx + 2 * rs, cy + rs,
+                                      start=0, extent=110, style=self._tkmod.ARC,
+                                      outline=_SPIN, width=max(2, int(round(2.5 * s))))
+        elif mode == "rec":
             # Barras como LINHAS com ponta redonda: e' o que da' o visual de
             # pilulinhas do Wispr; em repouso viram pontos. `x` e' o centro.
             x0 = (W - self._bars_w) // 2 + self._bw / 2.0
@@ -831,7 +840,7 @@ class Overlay:
                 if mode == "rec":
                     self._tk_anim_bars(st)
                 elif mode == "work":
-                    self._tk_anim_wave()
+                    self._tk_anim_spinner()
         except Exception:
             # Um frame perdido não pode matar o loop: sem mainloop a pílula
             # congela na tela por cima de tudo.
@@ -866,15 +875,12 @@ class Overlay:
             x = self._bar_x[i]
             cv.coords(item, x, cy - h, x, cy + h)
 
-    def _tk_anim_wave(self) -> None:
-        """Transcrevendo: uma onda varre as barras da esquerda para a direita,
-        o "shimmer" da Flow Bar. Sem texto, sem spinner."""
-        cv, cy = self._cv, self._h / 2.0
-        span = (self._bar_max - self._bar_min) * 0.6
-        for i, item in enumerate(self._bars):
-            h = self._bar_min + span * (0.5 + 0.5 * math.sin(self._frame * 0.22 - i * 0.55))
-            x = self._bar_x[i]
-            cv.coords(item, x, cy - h, x, cy + h)
+    def _tk_anim_spinner(self) -> None:
+        if self._arc is None:
+            return
+        start = (-self._frame * 9) % 360
+        extent = 70 + 60 * (0.5 + 0.5 * math.sin(self._frame * 0.11))
+        self._cv.itemconfigure(self._arc, start=start, extent=extent)
 
 
 # --------------------------------------------------------------------------
