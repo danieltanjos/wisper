@@ -40,7 +40,8 @@ Use python.org CPython 3.11 x64. Passe `-Python <caminho>` se não estiver no lu
 
 Se o PC novo não tiver GPU NVIDIA, o `Engine` cai para CPU sozinho — funciona, mas fica ~6x mais
 lento (RTF 0,34 contra 0,055). Para nuvem em vez de CPU: `"engine": "groq"` no `config.json` mais
-`GROQ_API_KEY` no ambiente. **Esse caminho nunca rodou ao vivo**, só compila e tem teste.
+`GROQ_API_KEY` no ambiente ou no `.env`. Com `engine: auto` (padrão) isso acontece sozinho quando
+a CUDA falha. Rodou ao vivo no notebook em 2026-09-17: 0,5 s por ditado.
 
 **Segundo PC (notebook i5-13420H, Intel UHD, headset Bluetooth JBL TUNE125TWS), 2026-09-17:**
 - Setup limpo funcionou de primeira. CUDA cai para CPU com `CUDA driver version is insufficient`
@@ -67,7 +68,11 @@ lento (RTF 0,34 contra 0,055). Para nuvem em vez de CPU: `"engine": "groq"` no `
   `int8_float32` (igual), `chunk_length` 20/15/10/6 (o CTranslate2 completa para 30 s por dentro:
   tempo igual, WER piora, 6 alucina). Modelos: `small` 2,4 s mas WER 38% (79% com ruído);
   `medium` mesma qualidade do turbo e quase o mesmo tempo. ISA: AVX2 só, sem AVX512/VNNI.
-  **Neste notebook a única saída para ~1 s é o Groq** (`engine: groq` + `GROQ_API_KEY`).
+  **Neste notebook a única saída para ~1 s é o Groq.** E é o que roda aqui: `engine: auto`
+  (padrão) cai para o Groq quando a CUDA falha e há `GROQ_API_KEY` (lida do `.env` da raiz pelo
+  `config.load_dotenv()`). **Rodou ao vivo em 2026-09-17:** 0,52 s para 3,8 s de fala. O primeiro
+  ditado deu 403 do Cloudflare (erro 1010, User-Agent `Python-urllib`); corrigido com User-Agent
+  próprio. No desktop o mesmo config fica na 4060 porque a CUDA carrega.
 
 ## O que está provado em hardware
 
