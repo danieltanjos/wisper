@@ -1,0 +1,83 @@
+# wisper -- dependencias verificadas nesta maquina (Windows 11 Pro 26200, RTX 4060 Ti).
+#
+# ###############################################################################
+# INTERPRETADOR OBRIGATORIO: python.org CPython 3.11 x64
+#   C:\Users\Administrador\AppData\Local\Programs\Python\Python311org\python.exe
+#
+# NAO use o Python da Microsoft Store. Ele tem identidade de pacote
+# (PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0) e por isso ganha uma
+# entrada propria no ConsentStore do microfone: com a permissao em "Prompt" o
+# InputStream() TRAVA PARA SEMPRE sem levantar excecao, esperando uma UI de
+# consentimento que nunca aparece; depois vira "Deny" e falha com -9999/-9996 em
+# todo device e host API. Ele tambem redireciona em silencio qualquer escrita em
+# %LOCALAPPDATA% e %APPDATA% para o sandbox do pacote.
+# Ver docs/ARCHITECTURE.md secao 4. O scripts/setup.ps1 recusa esse interpretador.
+# ###############################################################################
+#
+# Instale sempre por:  powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
+
+# --- STT local (faster-whisper na GPU) ---
+# Puxa sozinho huggingface_hub, tokenizers, av e onnxruntime. Nenhum dos quatro
+# esta listado aqui, mas o onnxruntime nao e opcional na pratica: o config tem
+# vad_filter=true e o VAD do faster-whisper (Silero) roda nele.
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+
+# --- CUDA userspace, via wheels ---
+# O ctranslate2.dll carrega cublas64_12.dll e cudnn*.dll DINAMICAMENTE: essas DLLs
+# nao estao na import table do PE. Sem elas o modelo ate carrega em device="cuda",
+# e so o transcribe() estoura com "Library cublas64_12.dll is not found".
+# Por isso wispr/stt.py chama os.add_dll_directory() em cada nvidia/*/bin ANTES de
+# importar faster_whisper (e usa nvidia.__path__, porque nvidia e namespace package
+# e nvidia.__file__ e None). Ver docs/ARCHITECTURE.md secao 2.
+# O que importa aqui e o par: cuBLAS 12.x + cuDNN 9.x, exigido pelo CTranslate2 4.8.
+nvidia-cublas-cu12==12.4.5.8
+nvidia-cudnn-cu12==9.1.0.70
+
+# --- captura de audio ---
+# comtypes e importado ANTES de sounddevice (com sys.coinit_flags = 0), senao o
+# Pa_Initialize() do PortAudio ja chamou CoInitializeEx(APARTMENTTHREADED) e o
+# import do comtypes levanta RPC_E_CHANGED_MODE. Ver docs/ARCHITECTURE.md secao 4.
+sounddevice==0.5.6
+soxr==1.1.0
+comtypes==1.4.16
+
+# --- DSP ---
+# soxr faz 48k->16k (rejeicao de alias -156 dB contra -73,6 dB do scipy);
+# o scipy entra so no Butterworth passa-alta de 80 Hz via sosfilt.
+# Limites largos de proposito: sao as faixas em que o projeto foi validado, nao
+# um pin. numpy<3 existe so para um major novo nao entrar sozinho num setup -Force.
+numpy>=1.26,<3
+scipy>=1.11
+
+# --- bandeja ---
+# O overlay usa tkinter, que ja vem no instalador do python.org (nao e pip).
+# Se o instalador foi rodado sem "tcl/tk and IDLE", o import de tkinter acha o
+# pacote mas o _tkinter.pyd nao existe - o setup.ps1 confere os dois.
+pystray==0.19.5
+Pillow>=10
+
+# --- reserva do ARCHITECTURE.md: instalado, ainda nao importado ---
+# Nenhum modulo de wispr/ importa os tres hoje (conferido por grep no pacote
+# inteiro). Ficam porque sao o caminho ja medido para o proximo passo de cada um:
+#   webrtcvad-wheels: VAD proprio em agressividade 2/3 com hangover de 10 frames,
+#     caso o vad_filter do faster-whisper se mostre caro (secao 4 do doc);
+#   soundfile: leitura/escrita de wav fora do modulo wave da stdlib, que e o que
+#     o app.py usa hoje para keep_recordings;
+#   pycaw: wrapper de alto nivel sobre o mesmo COM que wispr/audio.py ja fala na
+#     mao (IMMDeviceEnumerator, IAudioMeterInformation).
+# Consequencia de manter: se um deles nao tiver wheel cp311/win_amd64, o
+# `pip install -r` inteiro falha por um pacote que ninguem importa. Se isso
+# acontecer no seu setup, comente as tres linhas e siga - nada quebra.
+soundfile==0.14.0
+pycaw
+webrtcvad-wheels==2.0.14
+
+# --- deliberadamente AUSENTE ---
+# keyboard: casa hotkey por scan code, nao dispara em input injetado com scancode 0,
+#   nao mascara a tecla Win e key_to_scan_codes('c cedilha') levanta ValueError.
+#   O hook WH_KEYBOARD_LL em ctypes (wispr/hotkey.py) substitui. Secao 3 do doc.
+# pyautogui / pyperclip: SendInput com KEYEVENTF_UNICODE e o clipboard via Win32
+#   estao em wispr/inject.py, sem dependencia extra.
+# requests: o fallback da Groq monta o multipart/form-data na mao com urllib
+#   (wispr/stt.py). A ausencia e intencional - nao "conserte" adicionando aqui.

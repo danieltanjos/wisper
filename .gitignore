@@ -1,0 +1,47 @@
+# --- ambiente ---
+# Ancorados na raiz de proposito: sem a barra inicial o padrao casa em qualquer
+# profundidade e um dia engole uma pasta homonima dentro de wispr/ ou tests/.
+/.venv/
+/env/
+__pycache__/
+*.py[cod]
+*.pyd
+*.egg-info/
+
+# --- pesos do Whisper ---
+# models/ e o HF_HOME do projeto: sozinho passa de 1,6 GB. O repo tem que caber
+# num clone rapido; quem precisa dos pesos roda scripts/setup.ps1 -DownloadModel.
+/models/
+
+# --- logs e gravacoes ---
+# Cobre wisper.log, os 5 backups da rotacao, o crash.log do main.pyw, o
+# wisper-crash.log do faulthandler e logs/recordings/*.wav.
+/logs/
+
+# Gravacoes de ditado sao literalmente o que o usuario falou: nunca versionar.
+# O padrao e amplo de proposito, para pegar tambem copia solta em qualquer pasta.
+*.wav
+
+# Excecoes ao *.wav acima. Sem elas o `git add` ignora em silencio os audios de
+# referencia do tests/ (os WER de ptbr_* casados com tests/fixtures/refs.txt) e a
+# suite chega quebrada em quem clonar. Nenhum dos dois contem ditado do usuario.
+!tests/fixtures/*.wav
+!assets/*.wav
+
+# --- config local ---
+# Guarda groq_api_key e caminhos da maquina. O setup recria a partir dos DEFAULTS.
+# Ancorado: e o config.json da raiz, nao qualquer config.json (o snapshot do
+# modelo tem um, e fixtures de teste podem ter outro).
+/config.json
+.env
+
+# --- empacotamento e ferramentas ---
+build/
+dist/
+*.spec
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+Thumbs.db

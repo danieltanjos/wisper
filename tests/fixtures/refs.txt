@@ -1,0 +1,4 @@
+﻿ptbr_short|Cria um hook customizado em React para gerenciar o estado do formulario.
+ptbr_dev1|Preciso refatorar o endpoint de autenticacao porque o middleware esta retornando quatrocentos e um mesmo com o token valido. Vou abrir um pull request na branch de desenvolvimento.
+ptbr_plain|Hoje eu fui ate a padaria da esquina comprar pao frances e um cafe com leite bem quentinho.
+ptbr_dev2|Sobe o container com docker compose up e roda as migrations do Prisma antes de fazer o deploy na Vercel. Depois confere os logs no CloudWatch.
