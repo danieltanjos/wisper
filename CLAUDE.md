@@ -18,7 +18,7 @@ documentação copiada. `docs/CONTRACT.md` tem a API entre os módulos.
    hooks de teclado e injetou teclas enquanto ele jogava e atrapalhou tudo. Se você delegar para
    subagentes, **repita a regra dentro do prompt de cada um** — eles não herdam isso.
 2. O que é seguro rodar sozinho: `python -m py_compile`, e a suíte offline
-   `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (353 testes).
+   `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (359 testes).
    `tests/_safety.py` transforma `SendInput`, `SetWindowsHookExW` e `OpenClipboard` em bomba de
    `RuntimeError`, então a suíte é segura mesmo com alguém jogando.
 3. **Não lance o app de dentro de uma chamada de ferramenta comum** — o harness mata a árvore de
@@ -49,6 +49,15 @@ lento (RTF 0,34 contra 0,055). Para nuvem em vez de CPU: `"engine": "groq"` no `
 - O headset Bluetooth em mãos-livres (HFP) **só abre em 16 kHz** e responde `-9997 Invalid sample
   rate` a 48 kHz. O `Mic._open` agora reabre na taxa nativa do endpoint quando a configurada é
   recusada. `capture_sr` continua 48000 no config: é só o primeiro palpite.
+- **Microfone sob demanda** (`mic_on_demand: true`, padrão): o stream só existe do `Win+A` ao
+  `Enter`/`Esc`. O usuário viu "Microfone em uso por Python" o tempo todo e pediu isso. Custo: sem
+  pré-roll. `docs/ARCHITECTURE.md` seção 4 tem o desenho (`start()`/`stop()`, piso do `mark()`,
+  trava `_wanted` no supervisor). Falta confirmar ao vivo que o ícone de microfone some entre
+  ditados e que a primeira sílaba não é cortada.
+- **Pílula** redesenhada a pedido: preto, ondas brancas, 110x26 em vez de 240x54
+  (`wispr/overlay.py`, constantes no topo). Não foi vista ao vivo ainda.
+- A sonda de liveness do hook rodou aqui em DEBUG e disse `the hook is alive` — nesta máquina a
+  cadeia de hooks não é problema.
 
 ## O que está provado em hardware
 
@@ -89,8 +98,15 @@ Sete testes em `tests/test_regressions.py` (`PunctuationRunGuardTest`), três mu
 em memória, todos vermelhos. **WER idêntico antes e depois** (0,0 / 10,7 / 0,0; média 3,6%),
 medido com `tests/bench_wer.py` — não é `test_*` de propósito, ele carrega o modelo.
 
-**O que falta:** ditar de verdade e ver no Bloco de Notas. Se voltar a vazar, `keep_recordings`
-salva o wav em `logs/recordings/` e o `bench_wer.py` mostra como carregar um clipe pelo `Engine`.
+**Ao vivo no segundo PC (10:21–10:24), COM a correção rodando, ainda vazou:** o Bloco de Notas
+recebeu `Alô,ssssssssssssssssssssso ........................` (52 chars) e `Test your ....`
+(14 chars). A correção prova que `'Test your ....'` (4 pontos ASCII) vira `'Test your'` — logo o
+texto real tem outra forma que a tela não revela (14 chars cabe em `'Test your. . .'`: ponto
+colado na palavra mais dois soltos, que a cauda solta não conta). Ambiente ruim: mic Bluetooth
+"podre", muito barulho, o modelo loopou em `sss` e saiu em inglês. **Não adivinhe a forma:**
+`config.json` já está com `log_level: DEBUG` e `keep_recordings: true`, e o `_transcribe_local`
+loga em DEBUG `stt segments=[...] -> '...'` com o texto exato. Peça um ditado, leia o log, e só
+então ajuste o `strip_punct_runs`. Os wavs ficam em `logs/recordings/`.
 
 ### 2. `config.json` com BOM era ignorado inteiro, em silêncio — CORRIGIDO (2026-09-17)
 
@@ -145,7 +161,7 @@ marcado com `PROBE_TAG`, ver `_probe_hook` em `wispr/hotkey.py`).
 ## Como está o repositório
 
 - `main` em `https://github.com/danieltanjos/wisper` (privado).
-- 353 testes offline, todos verificados por mutação — cada correção foi remutada em memória para
+- 359 testes offline, todos verificados por mutação — cada correção foi remutada em memória para
   provar que o teste fica vermelho sem ela. Mantenha esse padrão: a suíte anterior tinha 180
   testes verdes e **não pegou nenhum** dos defeitos que o hardware achou.
 - Três auditorias adversariais (contrato, concorrência, modos de falha) mais duas rodadas de

@@ -411,6 +411,10 @@ class App:
         """
         if mic is None:
             return False
+        if getattr(mic, "on_demand", False) and not getattr(mic, "_wanted", True):
+            # Sob demanda e fora de um ditado: sem stream POR DESENHO. Vivo. Se o
+            # endpoint falhar, e' o start() do proximo Win+A que levanta.
+            return True
         unknown = object()
         try:
             stream = getattr(mic, "stream", unknown)
@@ -665,6 +669,15 @@ class App:
             self.log.exception("microphone unavailable")
             # Aviso na bandeja fica para depois: no boot ela ainda nao existe.
             return False
+
+    def _mic_idle(self) -> None:
+        """Solta o microfone entre ditados (sob demanda). Nunca levanta."""
+        stop = getattr(self.mic, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                self.log.exception("mic.stop() failed")
 
     def _start_hotkey(self) -> None:
         try:
@@ -952,9 +965,12 @@ class App:
             self._set_hotkey_recording(True)
 
         try:
+            start = getattr(self.mic, "start", None)
+            if callable(start):
+                start()                    # sob demanda: abre o stream agora
             self._mark = self.mic.mark()
         except Exception:
-            self.log.exception("mic.mark() failed")
+            self.log.exception("mic.start()/mark() failed")
             self._abort_recording(MSG_MIC_DEAD)
             return
 
@@ -1007,8 +1023,14 @@ class App:
             audio_48k, status = mic.take(mark)
         except Exception:
             self.log.exception("mic.take() failed")
+            self._mic_idle()
             self._fail(MSG_MIC_DEAD, sid=sid)
             return
+        # O audio ja esta copiado do ring: o microfone pode ser solto antes da
+        # transcricao, que na CPU leva segundos. O "vivo?" e' lido ANTES de soltar,
+        # senao um stream que morreu no meio da fala viraria "microfone mudo".
+        mic_alive = self._mic_alive(mic)
+        self._mic_idle()
 
         n = 0 if audio_48k is None else int(getattr(audio_48k, "size", 0))
         truncated = self._audio_is_truncated(mic, sid, n, rec_s)
@@ -1020,7 +1042,7 @@ class App:
             # reabrir, e o stream que morreu NO MEIO da fala -- neste ultimo o
             # pre-roll ainda carrega ruido de sala, o gate passa e o usuario ouvia
             # "nao entendi nada", culpando a propria diccao em vez do headset.
-            if not self._mic_alive(mic):
+            if not mic_alive:
                 msg = MSG_MIC_DEAD
             elif truncated:
                 msg = MSG_MIC_LOST
@@ -1083,6 +1105,7 @@ class App:
         self._disarm_timers()
         self.log.info("cancelled by user (session %d, state=%s)", sid, state)
         if state == _STATE_RECORDING:
+            self._mic_idle()
             self.overlay.hide()
         else:
             # Transcricao em voo: o job continua rodando por alguns segundos e so
@@ -1094,6 +1117,7 @@ class App:
     def _abort_recording(self, msg: str) -> None:
         """Sai de recording sem passar pelo worker."""
         self._disarm_timers()
+        self._mic_idle()
         with self._lock:
             self._state = _STATE_IDLE
             self._clear_hotkey_flags()

@@ -569,24 +569,37 @@ class Mic:
         self._watcher = None
         self._watcher_enum = None
 
+        # Sob demanda: o stream so' existe entre start() e stop(). `_wanted` e' o
+        # que o supervisor consulta -- sem stream E sem querer stream nao ha nada
+        # para reabrir. `_floor` impede o mark() de rebobinar para audio de ANTES
+        # do start(): o ring ainda guarda o ditado anterior.
+        self.on_demand = bool(self.cfg.get("mic_on_demand", True))
+        self._wanted = not self.on_demand
+        self._floor = 0
+
         opened = False
-        try:
-            # Espera COM PRAZO: Mic() nasce na thread do hotkey, logo depois do Win+A, e
-            # nesse instante o hook ja esta engolindo Enter e Esc. Se o `mic-sup`
-            # estiver pendurado dentro do _reopen de um endpoint que sumiu, esperar
-            # sem prazo aqui congelaria o Win+A do usuario sem nada na tela.
-            with _portaudio(PA_LOCK_TIMEOUT) as got:
-                if not got:
-                    raise RuntimeError(
-                        "PortAudio ocupado por outra thread (reabertura do endpoint "
-                        "em andamento); o supervisor abre a captura no proximo ciclo")
-                self._open()
-            opened = True
-        except Exception as exc:
-            # Sem microfone no boot o app ainda sobe; o supervisor fica tentando.
-            self.last_error = str(exc)[:160]
-            self._dead = True
-            self._emit("stream_dead", active=False, err=self.last_error)
+        if self.on_demand:
+            # Sem abrir nada no boot. Falha de endpoint aparece no primeiro Win+A,
+            # em start(), que e' onde o usuario esta olhando.
+            self._dead = False
+        else:
+            try:
+                # Espera COM PRAZO: Mic() nasce na thread do hotkey, logo depois do
+                # Win+A, e nesse instante o hook ja esta engolindo Enter e Esc. Se o
+                # `mic-sup` estiver pendurado dentro do _reopen de um endpoint que
+                # sumiu, esperar sem prazo aqui congelaria o Win+A do usuario.
+                with _portaudio(PA_LOCK_TIMEOUT) as got:
+                    if not got:
+                        raise RuntimeError(
+                            "PortAudio ocupado por outra thread (reabertura do endpoint "
+                            "em andamento); o supervisor abre a captura no proximo ciclo")
+                    self._open()
+                opened = True
+            except Exception as exc:
+                # Sem microfone no boot o app ainda sobe; o supervisor fica tentando.
+                self.last_error = str(exc)[:160]
+                self._dead = True
+                self._emit("stream_dead", active=False, err=self.last_error)
 
         global _active_mic
         _active_mic = weakref.ref(self)
@@ -753,13 +766,46 @@ class Mic:
             self._cb_err = repr(exc)[:160]
 
     # ---------------------------------------------------------------- gravacao
+    def start(self) -> None:
+        """Sob demanda: abre o stream para um ditado. Levanta se o endpoint falhar.
+
+        Chamada na thread do hotkey, logo depois do Win+A. Enquanto `_wanted`
+        estiver ligado o supervisor reabre como sempre fez.
+        """
+        if not self.on_demand:
+            return
+        self._wanted = True
+        if _stream_active(self.stream, unknown=True):
+            return
+        try:
+            with _portaudio(PA_LOCK_TIMEOUT) as got:
+                if not got:
+                    raise RuntimeError("PortAudio ocupado por outra thread")
+                self._close_stream(abort=True)
+                self._open()
+        except Exception as exc:
+            self.last_error = str(exc)[:160]
+            self._dead = True
+            self._emit("stream_dead", active=False, err=self.last_error)
+            raise
+        self._floor = self.written
+        self._dead = False
+        self._emit_open()
+
+    def stop(self) -> None:
+        """Sob demanda: solta o microfone. Idempotente; no modo sempre-aberto nao faz nada."""
+        if not self.on_demand:
+            return
+        self._wanted = False
+        self._close_stream()
+
     def mark(self) -> int:
         """Marca o inicio da gravacao ja rebobinado pelo pre-roll.
 
         Sem esse recuo a primeira silaba some: entre a tecla e o `mark()` o usuario
         ja comecou a falar.
         """
-        return max(0, self.written - int(self.sr * self.preroll_sec))
+        return max(self._floor, self.written - int(self.sr * self.preroll_sec))
 
     def _slice(self, end: int, n: int) -> np.ndarray:
         size = self.ring.size
@@ -866,6 +912,12 @@ class Mic:
             if self._cb_err:
                 err, self._cb_err = self._cb_err, ""
                 log.error("audio callback error: %s", err)
+
+            if not self._wanted:
+                # Sob demanda, fora de um ditado: nao ha stream e nao deve haver.
+                last = self.written
+                fails = 0
+                continue
 
             # unknown=True: lock ocupado quer dizer que alguem esta mexendo no
             # stream agora, nao que ele morreu — reabrir por cima seria pior.

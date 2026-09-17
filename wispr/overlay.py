@@ -273,19 +273,20 @@ def _primary_size(fallback_w: int, fallback_h: int) -> tuple[int, int]:
 # Magenta é a cor-chave do -transparentcolor: cada pixel dessa cor vira um
 # buraco 100% transparente na janela. Nada do desenho pode usá-la.
 _KEY = "#ff00ff"
-_BG = "#17171b"
-_EDGE = "#34343d"
-_BAR = "#5ad67d"
-_SPIN = "#7aa2f7"
-_TXT = "#e6e6e6"
+# Preto com ondas brancas, e pequena: a pilula original (240x54) era gigante.
+_BG = "#000000"
+_EDGE = "#3a3a3a"
+_BAR = "#ffffff"
+_SPIN = "#ffffff"
+_TXT = "#ffffff"
 
-_BASE_W = 240
-_BASE_H = 54
+_BASE_W = 110
+_BASE_H = 26
 _NBARS = 9
-_BAR_W = 5
-_BAR_GAP = 7
-_FONT_PX = 13
-_SPIN_R = 11
+_BAR_W = 3
+_BAR_GAP = 4
+_FONT_PX = 11
+_SPIN_R = 7
 
 _LABEL_WORK = "transcrevendo…"
 _TICK_MS = 33
@@ -410,7 +411,7 @@ class Overlay:
         self._bars_w = _NBARS * _BAR_W + (_NBARS - 1) * _BAR_GAP
         self._spin_r = _SPIN_R
         self._bar_min = 1.5
-        self._bar_max = _BASE_H / 2.0 - 9.0
+        self._bar_max = _BASE_H / 2.0 - 4.0
         self._bars = []
         self._bar_x = []
         self._bar_a = [1.5] * _NBARS
@@ -613,7 +614,7 @@ class Overlay:
         self._bars_w = _NBARS * self._bw + (_NBARS - 1) * self._gap
         self._spin_r = max(5, int(round(_SPIN_R * s)))
         self._bar_min = max(1.5, 1.5 * s)
-        self._bar_max = max(self._bar_min + 2.0, self._h / 2.0 - max(8.0, 9.0 * s))
+        self._bar_max = max(self._bar_min + 2.0, self._h / 2.0 - max(3.0, 4.0 * s))
         # perfil de altura: barras do meio mais altas, como num medidor real
         self._bar_shape = [0.55 + 0.45 * math.cos((i - (_NBARS - 1) / 2.0) * math.pi / _NBARS)
                            for i in range(_NBARS)]

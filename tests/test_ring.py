@@ -169,6 +169,7 @@ class _MicHarness:
         mic = object.__new__(mic_cls)          # nunca chama __init__: nada e aberto
         mic.ring = np.zeros(int(ring_frames), dtype=np.float32)
         mic.written = 0
+        mic._floor = 0                         # piso do mark(): sem start() e' 0
         mic.sr = int(sr)
         mic.ring_sec = ring_frames / float(sr)
         # `block` plantado de proposito: o take() le ele com getattr(..., BLOCK) e,

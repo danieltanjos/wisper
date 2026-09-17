@@ -625,6 +625,9 @@ class Engine:
         out = postprocess(text, self.cfg.get("fixups"), single_short_segment=single_short)
         log.info("stt ok backend=%s dur=%.1fs t=%.2fs rtf=%.3f chars=%d",
                  self.backend, dur, took, (took / dur if dur else 0.0), len(out))
+        # So em DEBUG: e' o texto do usuario. Sem isto nao ha como saber que
+        # forma exata uma corrida de pontos tinha quando ela vaza.
+        log.debug("stt segments=%r -> %r", [t[:60] for t in texts], out[:200])
         return out
 
     def _transcribe_groq(self, audio: np.ndarray) -> str:

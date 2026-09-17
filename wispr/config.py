@@ -88,6 +88,11 @@ DEFAULTS = {
     "groq_timeout_sec": 30,
 
     # --- audio ---
+    # O stream so' fica aberto do Win+A ao Enter/Esc. Fora disso o Windows nao
+    # mostra "microfone em uso" e um headset Bluetooth volta para A2DP (musica com
+    # qualidade) em vez de ficar preso no perfil maos-livres. Custo: o pre-roll
+    # (rebobinar 0,35 s antes do Win+A) deixa de existir, porque nao havia captura.
+    "mic_on_demand": True,
     "capture_sr": 48000,
     "target_sr": 16000,
     # O ring e' o teto REAL de uma fala: o que nao cabe nele e' sobrescrito antes

@@ -119,7 +119,17 @@ Segunda opção: Cloudflare Workers AI `@cf/openai/whisper-large-v3-turbo`.
   sem `/RL HIGHEST` — a criação da tarefa precisa de uma passada com UAC.
 - `Ctrl+Alt+A` é aceito normalmente por `RegisterHotKey` — fica como chord alternativo.
 
-## 4. Áudio: WASAPI compartilhado, stream sempre aberto
+## 4. Áudio: WASAPI compartilhado, stream sob demanda
+
+- **Desde 2026-09-17 o stream só existe do `Win+A` ao `Enter`/`Esc`** (`mic_on_demand: true`,
+  padrão). Motivo, visto no segundo PC: o Windows mostrava "Microfone em uso por Python" o tempo
+  todo, e um headset Bluetooth fica preso no perfil mãos-livres (música com qualidade de
+  telefone) enquanto qualquer app segura o microfone. O que muda: `Mic.start()` abre, `Mic.stop()`
+  fecha, o supervisor só reabre enquanto `_wanted` está ligado, e o `mark()` tem um piso no
+  `start()` para nunca rebobinar para dentro do ditado anterior que ainda está no ring.
+  O que se perde: o **pré-roll** de 0,35 s — não havia captura antes da tecla. A abertura mede
+  ~9 ms no WASAPI quente; em Bluetooth HFP pode ser bem mais, e aí a primeira sílaba pode sumir.
+  `"mic_on_demand": false` devolve o stream permanente. Tudo abaixo vale para os dois modos.
 
 - **Interpretador:** python.org CPython 3.11.9, **não** o da Microsoft Store. O Store Python
   tem identidade de pacote (`PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0`) com entrada

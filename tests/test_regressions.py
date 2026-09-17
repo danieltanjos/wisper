@@ -71,6 +71,7 @@ for _p in (_os.path.dirname(_HERE), _HERE):
 
 import _safety  # noqa: E402  stubs antes de qualquer import de wispr
 
+import contextlib
 import ctypes
 import inspect
 import re
@@ -2374,6 +2375,131 @@ class OfflineModelLoadTest(unittest.TestCase):
             self.assertIn(name, src)
         self.assertLess(src.index("self.offline"), src.index('"groq"'),
                         "tem que nascer ANTES do retorno antecipado do groq")
+
+
+@unittest.skipUnless(_audio, _why_audio or "wispr.audio indisponivel")
+class MicOnDemandTest(unittest.TestCase):
+    """O stream so' existe entre start() e stop().
+
+    Pedido do usuario no segundo PC: o Windows mostrava "Microfone em uso por
+    Python" o tempo todo, e um headset Bluetooth preso no perfil maos-livres
+    toca musica com qualidade de telefone. Fora de um ditado nao ha stream e o
+    supervisor nao pode reabrir um.
+    """
+
+    class PAErr(Exception):
+        pass
+
+    def _mic(self, on_demand=True):
+        opened = []
+
+        class FakeStream:
+            active = True
+
+            def __init__(self, **kw):
+                opened.append(kw)
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                self.active = False
+
+            def abort(self):
+                self.active = False
+
+        sd = types.SimpleNamespace(
+            InputStream=FakeStream, PortAudioError=self.PAErr,
+            query_devices=lambda d: {"hostapi": 0, "default_samplerate": 48000.0},
+            query_hostapis=lambda i: {"name": "Windows WASAPI"})
+        mic = object.__new__(_audio.Mic)
+        mic.sr, mic.block, mic.stream, mic.last_error = 48000, 480, None, ""
+        mic.preroll_sec, mic.written, mic._floor = 0.35, 0, 0
+        mic.on_demand, mic._wanted, mic._dead = on_demand, not on_demand, False
+        mic.reopens = mic.reopen_attempts = 0
+        mic.device, mic.name, mic.hostapi, mic.fallback = -1, "", "", False
+        mic.on_event = lambda *a, **k: None
+        mic._cb = lambda *a: None
+        mic._cb_err = ""
+        mic._stop = threading.Event()
+        mic._retarget = threading.Event()
+        mic.poll_sec = 0.01
+        return mic, sd, opened
+
+    def _stack(self, sd):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(_audio, "sd", sd))
+        stack.enter_context(mock.patch.object(_audio, "resolve_device",
+                                              lambda: (18, "Headset", False)))
+        self.addCleanup(stack.close)
+        return stack
+
+    def test_start_opens_and_stop_closes(self):
+        mic, sd, opened = self._mic()
+        with self._stack(sd):
+            mic.start()
+            self.assertEqual(len(opened), 1)
+            self.assertTrue(mic._wanted)
+            self.assertIsNotNone(mic.stream)
+            mic.stop()
+            self.assertFalse(mic._wanted)
+            self.assertIsNone(mic.stream)
+
+    def test_mark_never_rewinds_into_the_previous_dictation(self):
+        # O ring guarda o ditado anterior. Sem o piso, mark() rebobinaria 0,35 s
+        # para dentro dele e o take() devolveria fala velha como se fosse nova.
+        mic, sd, _ = self._mic()
+        mic.written = 48000 * 10                  # 10 s ja escritos por um ditado antigo
+        with self._stack(sd):
+            mic.start()
+        self.assertEqual(mic.mark(), 48000 * 10)
+        mic.written += 4800
+        self.assertEqual(mic.mark(), 48000 * 10, "o pre-roll nao pode passar do start()")
+
+    def test_stop_is_a_noop_when_always_open(self):
+        mic, sd, opened = self._mic(on_demand=False)
+        with self._stack(sd):
+            mic._open()
+            mic.stop()
+        self.assertIsNotNone(mic.stream, "no modo sempre-aberto stop() nao fecha nada")
+        self.assertTrue(mic._wanted)
+
+    def test_a_failed_start_raises_and_leaves_the_mic_dead(self):
+        mic, sd, _ = self._mic()
+        err = self.PAErr
+
+        def boom(**kw):
+            raise err("Error opening InputStream: Device unavailable", -9985)
+
+        sd.InputStream = boom
+        with self._stack(sd):
+            with self.assertRaises(self.PAErr):
+                mic.start()
+        self.assertTrue(mic._dead)
+        self.assertIsNone(mic.stream)
+
+    def test_the_supervisor_does_not_reopen_while_idle(self):
+        mic, sd, _ = self._mic()
+        reopens = []
+        mic._reopen = lambda: reopens.append(1) or True
+        with self._stack(sd):
+            t = threading.Thread(target=mic._supervise, daemon=True)
+            t.start()
+            time.sleep(0.08)                      # ~8 rondas sem stream e sem _wanted
+            mic._stop.set()
+            t.join(1.0)
+        self.assertEqual(reopens, [], "supervisor reabriu um stream que ninguem pediu")
+
+    def test_the_app_treats_an_idle_on_demand_mic_as_alive(self):
+        if _app is None:
+            self.skipTest(_why_app or "wispr.app indisponivel")
+        mic = types.SimpleNamespace(on_demand=True, _wanted=False, stream=None)
+        self.assertTrue(_app.App._mic_alive(mic))
+        mic._wanted = True
+        self.assertFalse(_app.App._mic_alive(mic), "querendo stream e sem stream = morto")
 
 
 @unittest.skipUnless(_audio, _why_audio or "wispr.audio indisponivel")
