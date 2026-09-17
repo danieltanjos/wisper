@@ -45,7 +45,7 @@ class DefaultsTest(unittest.TestCase):
     def test_attribute_access(self):
         cfg = config.load(self.path)
         self.assertEqual(cfg.hotkey, cfg["hotkey"])
-        self.assertEqual(cfg.engine, "local")
+        self.assertEqual(cfg.engine, "auto")
         self.assertEqual(cfg.language, "pt")
 
     def test_attribute_write_reaches_the_dict(self):
@@ -261,6 +261,36 @@ class CorruptFileTest(unittest.TestCase):
         self.path.write_text("{}", encoding="utf-8")
         config.load(self.path)
         self.assertIsNone(config.load_error)
+
+
+class DotenvTest(unittest.TestCase):
+    """`.env` na raiz entra no ambiente sem sobrescrever o que ja existe."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="wisper_env_"))
+        self.path = self.tmp / ".env"
+        for k in ("WISPER_T_A", "WISPER_T_B", "WISPER_T_C"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k in ("WISPER_T_A", "WISPER_T_B", "WISPER_T_C"):
+            os.environ.pop(k, None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_keys_reach_the_environment_and_quotes_are_stripped(self):
+        self.path.write_bytes(b'\xef\xbb\xbf# comentario\nWISPER_T_A=abc\nWISPER_T_B = "x y"\n\nlixo\n')
+        self.assertEqual(config.load_dotenv(self.path), 2)
+        self.assertEqual(os.environ["WISPER_T_A"], "abc")
+        self.assertEqual(os.environ["WISPER_T_B"], "x y")
+
+    def test_an_existing_variable_wins_over_the_file(self):
+        os.environ["WISPER_T_C"] = "do_ambiente"
+        self.path.write_text("WISPER_T_C=do_arquivo\n", encoding="utf-8")
+        self.assertEqual(config.load_dotenv(self.path), 0)
+        self.assertEqual(os.environ["WISPER_T_C"], "do_ambiente")
+
+    def test_missing_file_is_fine(self):
+        self.assertEqual(config.load_dotenv(self.tmp / "nao_existe"), 0)
 
 
 class SaveWritesOnlyTheDiffTest(unittest.TestCase):

@@ -28,6 +28,30 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 MUTEX_NAME = "Local\\WisprCloneDaniel"
 
+
+def load_dotenv(path: Path | None = None) -> int:
+    """Le KEY=VALUE de `.env` na raiz para o ambiente, SEM sobrescrever o que ja
+    existe. Devolve quantas chaves entraram. E' onde a GROQ_API_KEY mora nesta
+    maquina; nenhuma dependencia so' para isso."""
+    path = Path(path) if path else ROOT / ".env"
+    n = 0
+    try:
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key, val = key.strip(), val.strip().strip("'\"")
+            if key and key not in os.environ:
+                os.environ[key] = val
+                n += 1
+    except OSError:
+        pass
+    return n
+
+
+load_dotenv()
+
 # Motivo do ultimo config.json ignorado, ou None. O App.run() reloga isso como
 # WARNING depois que o logging existe: o primeiro load() roda antes dele, e sob
 # pythonw o aviso emitido aqui nao tem para onde ir.
@@ -65,7 +89,9 @@ DEFAULTS = {
     "max_record_sec": 175,
 
     # --- motor de transcricao ---
-    "engine": "local",              # "local" | "groq"
+    # "auto": GPU local se carregar; senao Groq se houver GROQ_API_KEY; senao CPU.
+    # O mesmo config serve no desktop com a 4060 e no notebook sem GPU.
+    "engine": "auto",               # "auto" | "local" | "groq"
     "model_id": "deepdml/faster-whisper-large-v3-turbo-ct2",
     "compute_type": "int8_float16",  # 1024 MB de VRAM, WER igual ao float16
     "device": "cuda",               # cai para "cpu" sozinho se a CUDA falhar

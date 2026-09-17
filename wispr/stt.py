@@ -452,6 +452,11 @@ def _multipart(fields: dict, file_field: str, filename: str, payload: bytes) -> 
 
 
 # ----------------------------------------------------------------------- Engine
+def groq_key(cfg) -> str:
+    """Chave do Groq: config.json, senao GROQ_API_KEY (o config.py ja leu o .env)."""
+    return str(cfg.get("groq_api_key") or os.environ.get("GROQ_API_KEY") or "").strip()
+
+
 class Engine:
     """Motor de transcricao residente. Um modelo, varias threads possiveis."""
 
@@ -471,11 +476,9 @@ class Engine:
         self.offline = False       # True = o boot nao falou com a rede
         _check_prompt(self._decode.get("initial_prompt"))
 
-        if str(self.cfg.get("engine") or "local").lower() == "groq":
-            self.backend = "groq"
-            self.model_id = str(self.cfg.get("groq_model") or "whisper-large-v3-turbo")
-            self.ready = True
-            log.info("stt backend=groq model=%s", self.model_id)
+        engine = str(self.cfg.get("engine") or "auto").lower()
+        if engine == "groq":
+            self._use_groq()
             return
 
         self.model_id = str(self.cfg.get("model_id") or config.DEFAULTS["model_id"])
@@ -514,11 +517,18 @@ class Engine:
             # So ~1,5 GB de VRAM livre com o desktop em uso: OOM aqui e caminho
             # esperado, nao bug. E a falha do cublas so aparece quando o encoder
             # roda, por isso o warmup faz parte da tentativa.
-            log.exception("model load failed on device=%s compute_type=%s; falling back to cpu",
+            log.exception("model load failed on device=%s compute_type=%s; falling back",
                           device, ctype)
             if device == "cpu":
                 raise TranscriptionError(
                     "Nao foi possivel carregar o modelo de transcricao. Veja o log.")
+            if engine == "auto" and groq_key(self.cfg):
+                # Sem GPU e com chave: nuvem antes da CPU. Medido no notebook:
+                # a CPU custa 6,5-8 s FIXOS por ditado (encoder da janela de 30 s)
+                # e nenhum ajuste local muda isso; ver CLAUDE.md.
+                log.info("engine=auto: no cuda, GROQ_API_KEY present -> groq instead of cpu")
+                self._use_groq()
+                return
             try:
                 self.model, self.batched, self.warm_s = self._load(
                     WhisperModel, BatchedInferencePipeline, "cpu", cpu_ctype)
@@ -533,6 +543,12 @@ class Engine:
         self.ready = True
         log.info("stt backend=%s model=%s offline=%s load=%.2fs warm=%.3fs",
                  self.backend, self.model_id, self.offline, self.load_s, self.warm_s)
+
+    def _use_groq(self) -> None:
+        self.backend = "groq"
+        self.model_id = str(self.cfg.get("groq_model") or "whisper-large-v3-turbo")
+        self.ready = True
+        log.info("stt backend=groq model=%s", self.model_id)
 
     # ---------------------------------------------------------------- interno
     def _load(self, WhisperModel, BatchedPipeline, device: str, ctype: str):
@@ -632,7 +648,7 @@ class Engine:
 
     def _transcribe_groq(self, audio: np.ndarray) -> str:
         cfg = self.cfg
-        key = str(cfg.get("groq_api_key") or os.environ.get("GROQ_API_KEY") or "").strip()
+        key = groq_key(cfg)
         if not key:
             raise TranscriptionError(
                 "Groq sem chave: preencha groq_api_key no config.json ou defina GROQ_API_KEY.")

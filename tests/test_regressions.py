@@ -2177,6 +2177,48 @@ class PunctuationRunGuardTest(unittest.TestCase):
 
 
 @unittest.skipUnless(_stt, _why_stt or "wispr.stt indisponivel")
+class EngineAutoTest(unittest.TestCase):
+    """`engine: auto`: GPU local se carregar; senao Groq se houver chave; senao CPU.
+
+    O mesmo config.json serve no desktop com a 4060 e no notebook sem GPU, onde a
+    CPU custa 6,5-8 s fixos por ditado (medido) e o Groq fica abaixo de 1 s.
+    """
+
+    def _engine(self, engine, key, cuda_ok):
+        cfg = _config.load()
+        cfg["engine"] = engine
+        cfg["groq_api_key"] = key
+        fake_fw = types.SimpleNamespace(WhisperModel=object, BatchedInferencePipeline=object)
+
+        def load(_self, _wm, _bp, device, _ctype):
+            if device == "cuda" and not cuda_ok:
+                raise RuntimeError("CUDA driver version is insufficient for CUDA runtime version")
+            return object(), None, 0.0
+
+        with mock.patch.dict(_sys.modules, {"faster_whisper": fake_fw}), \
+                mock.patch.object(_stt, "_add_cuda_dll_dirs", lambda: []), \
+                mock.patch.object(_stt, "resolve_model_source", lambda mid: (mid, True)), \
+                mock.patch.object(_stt.Engine, "_load", load), \
+                mock.patch.dict(_os.environ, {"GROQ_API_KEY": ""}):
+            return _stt.Engine(cfg)
+
+    def test_auto_without_cuda_and_with_a_key_goes_to_groq(self):
+        self.assertEqual(self._engine("auto", "gsk_teste", cuda_ok=False).backend, "groq")
+
+    def test_auto_without_cuda_and_without_a_key_goes_to_cpu(self):
+        self.assertEqual(self._engine("auto", "", cuda_ok=False).backend, "cpu")
+
+    def test_auto_with_cuda_stays_local_even_with_a_key(self):
+        self.assertEqual(self._engine("auto", "gsk_teste", cuda_ok=True).backend, "cuda")
+
+    def test_explicit_local_never_goes_to_the_cloud(self):
+        self.assertEqual(self._engine("local", "gsk_teste", cuda_ok=False).backend, "cpu")
+
+    def test_the_default_engine_is_auto(self):
+        self.assertEqual(_config.DEFAULTS["engine"], "auto")
+
+
+@unittest.skipUnless(_stt, _why_stt or "wispr.stt indisponivel")
 class TemperatureLadderTest(unittest.TestCase):
     """A correcao de verdade: decode greedy, sem sorteio.
 
