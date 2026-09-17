@@ -673,9 +673,29 @@ class Mic:
             self.hostapi = sd.query_hostapis(info["hostapi"])["name"]
         except Exception:
             self.hostapi = ""
-        self.stream = sd.InputStream(device=self.device, samplerate=self.sr, channels=1,
-                                     dtype="float32", blocksize=self.block, latency="low",
-                                     callback=self._cb)
+        try:
+            self.stream = sd.InputStream(device=self.device, samplerate=self.sr, channels=1,
+                                         dtype="float32", blocksize=self.block, latency="low",
+                                         callback=self._cb)
+        except sd.PortAudioError as exc:
+            # Headset Bluetooth em maos-livres (HFP) so abre na taxa nativa dele,
+            # 16 kHz, e responde -9997 a qualquer outra. Medido: JBL TUNE125TWS,
+            # WASAPI. Sem isto o mic ficava "dead" para sempre, reabrindo a cada
+            # backoff com os mesmos 48 kHz.
+            native = int(info.get("default_samplerate") or 0)
+            if "sample rate" not in str(exc).lower() or native <= 0 or native == self.sr:
+                raise
+            log.warning("%s rejects %d Hz (%s); opening at its native %d Hz",
+                        self.name, self.sr, exc, native)
+            # O ring fica como esta: em amostras nao muda, em segundos cresce (16 kHz
+            # triplica). mark() e to_whisper() leem self.sr ao vivo.
+            # ponytail: taxa nativa ACIMA da configurada encurta o ring em segundos;
+            # redimensionar aqui se aparecer um endpoint de 96 kHz.
+            self.sr = native
+            self.block = min(self.block, native)
+            self.stream = sd.InputStream(device=self.device, samplerate=native, channels=1,
+                                         dtype="float32", blocksize=self.block, latency="low",
+                                         callback=self._cb)
         self.stream.start()
         self.last_error = ""
 

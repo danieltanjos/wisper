@@ -2376,6 +2376,66 @@ class OfflineModelLoadTest(unittest.TestCase):
                         "tem que nascer ANTES do retorno antecipado do groq")
 
 
+@unittest.skipUnless(_audio, _why_audio or "wispr.audio indisponivel")
+class NativeSampleRateFallbackTest(unittest.TestCase):
+    """Headset Bluetooth em maos-livres so abre em 16 kHz.
+
+    Medido no segundo PC (JBL TUNE125TWS, WASAPI device 18): 48 kHz respondia
+    `Invalid sample rate [-9997]` e o mic ficava "dead" para sempre, reabrindo a
+    cada backoff com a mesma taxa. `_open` tem que tentar a taxa nativa do
+    endpoint antes de desistir.
+    """
+
+    class PAErr(Exception):
+        pass
+
+    def _fake_sd(self, accept, opened, native, msg):
+        err = self.PAErr
+
+        class FakeStream:
+            def __init__(self, **kw):
+                if kw["samplerate"] not in accept:
+                    raise err(msg, -9997)
+                opened.append(kw)
+
+            def start(self):
+                pass
+
+        return types.SimpleNamespace(
+            InputStream=FakeStream, PortAudioError=err,
+            query_devices=lambda d: {"hostapi": 0, "default_samplerate": float(native)},
+            query_hostapis=lambda i: {"name": "Windows WASAPI"})
+
+    def _open(self, accept, native=16000, msg="Error opening InputStream: Invalid sample rate"):
+        opened = []
+        mic = object.__new__(_audio.Mic)
+        mic.sr, mic.block, mic.stream, mic.last_error = 48000, 480, None, ""
+        mic._cb = lambda *a: None
+        with mock.patch.object(_audio, "sd", self._fake_sd(accept, opened, native, msg)), \
+                mock.patch.object(_audio, "resolve_device", lambda: (18, "Headset (JBL)", False)):
+            mic._open()
+        return mic, opened
+
+    def test_a_device_that_rejects_the_configured_rate_opens_at_its_native_rate(self):
+        mic, opened = self._open(accept={16000})
+        self.assertEqual([o["samplerate"] for o in opened], [16000])
+        self.assertEqual(mic.sr, 16000, "to_whisper() e mark() leem mic.sr ao vivo")
+        self.assertLessEqual(mic.block, 16000)
+
+    def test_a_device_that_accepts_the_configured_rate_is_not_touched(self):
+        mic, opened = self._open(accept={48000, 16000})
+        self.assertEqual([o["samplerate"] for o in opened], [48000])
+        self.assertEqual(mic.sr, 48000)
+
+    def test_any_other_portaudio_error_still_propagates(self):
+        with self.assertRaises(self.PAErr):
+            self._open(accept=set(), msg="Error opening InputStream: Device unavailable")
+
+    def test_a_native_rate_equal_to_the_configured_one_does_not_retry_forever(self):
+        with self.assertRaises(self.PAErr):
+            self._open(accept=set(), native=48000)
+
+
 # --------------------------------------------------------------------------- #
 # Verificacao independente das duas correcoes de bring-up. Dois defeitos que
 # nenhuma das duas rodadas pegou, e nenhum deles aparece como erro:

@@ -18,7 +18,7 @@ documentação copiada. `docs/CONTRACT.md` tem a API entre os módulos.
    hooks de teclado e injetou teclas enquanto ele jogava e atrapalhou tudo. Se você delegar para
    subagentes, **repita a regra dentro do prompt de cada um** — eles não herdam isso.
 2. O que é seguro rodar sozinho: `python -m py_compile`, e a suíte offline
-   `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (349 testes).
+   `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (353 testes).
    `tests/_safety.py` transforma `SendInput`, `SetWindowsHookExW` e `OpenClipboard` em bomba de
    `RuntimeError`, então a suíte é segura mesmo com alguém jogando.
 3. **Não lance o app de dentro de uma chamada de ferramenta comum** — o harness mata a árvore de
@@ -41,6 +41,14 @@ Use python.org CPython 3.11 x64. Passe `-Python <caminho>` se não estiver no lu
 Se o PC novo não tiver GPU NVIDIA, o `Engine` cai para CPU sozinho — funciona, mas fica ~6x mais
 lento (RTF 0,34 contra 0,055). Para nuvem em vez de CPU: `"engine": "groq"` no `config.json` mais
 `GROQ_API_KEY` no ambiente. **Esse caminho nunca rodou ao vivo**, só compila e tem teste.
+
+**Segundo PC (notebook i5-13420H, Intel UHD, headset Bluetooth JBL TUNE125TWS), 2026-09-17:**
+- Setup limpo funcionou de primeira. CUDA cai para CPU com `CUDA driver version is insufficient`
+  (não há driver NVIDIA), load 11 s, warm 8 s, RTF **0,58–1,4** nos fixtures. Bem pior que o 0,34
+  do desktop: ditado de 10 s leva de 6 a 14 s para virar texto.
+- O headset Bluetooth em mãos-livres (HFP) **só abre em 16 kHz** e responde `-9997 Invalid sample
+  rate` a 48 kHz. O `Mic._open` agora reabre na taxa nativa do endpoint quando a configurada é
+  recusada. `capture_sr` continua 48000 no config: é só o primeiro palpite.
 
 ## O que está provado em hardware
 
@@ -137,7 +145,7 @@ marcado com `PROBE_TAG`, ver `_probe_hook` em `wispr/hotkey.py`).
 ## Como está o repositório
 
 - `main` em `https://github.com/danieltanjos/wisper` (privado).
-- 349 testes offline, todos verificados por mutação — cada correção foi remutada em memória para
+- 353 testes offline, todos verificados por mutação — cada correção foi remutada em memória para
   provar que o teste fica vermelho sem ela. Mantenha esse padrão: a suíte anterior tinha 180
   testes verdes e **não pegou nenhum** dos defeitos que o hardware achou.
 - Três auditorias adversariais (contrato, concorrência, modos de falha) mais duas rodadas de
