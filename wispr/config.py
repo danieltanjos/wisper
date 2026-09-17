@@ -121,7 +121,7 @@ DEFAULTS = {
     "overlay": True,
     "overlay_idle_pill": True,      # traco cinza no rodape entre ditados, como a Flow Bar
     "overlay_offset_y": 110,
-    "sounds": True,
+    "sounds": False,                # pedido do usuario: nenhum bip; a pilula ja avisa
     "notify_on_error": True,
 
     # --- diagnostico ---
