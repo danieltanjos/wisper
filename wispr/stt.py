@@ -664,6 +664,10 @@ class Engine:
         req.add_header("Authorization", "Bearer " + key)
         req.add_header("Content-Type", "multipart/form-data; boundary=" + boundary)
         req.add_header("Accept", "application/json")
+        # Sem isto o urllib manda "Python-urllib/3.11" e o Cloudflare do Groq
+        # responde 403 "Error 1010: Access denied ... browser's signature".
+        # Visto ao vivo no primeiro ditado pela nuvem, 2026-09-17.
+        req.add_header("User-Agent", "wisper/1.0 (+https://github.com/danieltanjos/wisper)")
 
         timeout = float(cfg.get("groq_timeout_sec") or 30)
         t0 = time.perf_counter()
