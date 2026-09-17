@@ -508,6 +508,9 @@ class App:
             # ninguem consegue ler o motivo.
             self.log.exception("logging setup failed; continuing with the bare logger")
         log_environment(self.log)
+        if config.load_error:
+            # O aviso do config.load() saiu antes de o logging existir.
+            self.log.warning("config.json ignored, using defaults: %s", config.load_error)
 
         atexit.register(self.shutdown)
         self._install_signal_handlers()

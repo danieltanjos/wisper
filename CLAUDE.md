@@ -3,7 +3,7 @@
 Clone do WisprFlow para Windows 11. `Win+A` grava, `Enter` finaliza e digita o texto na janela
 em foco, `Esc` cancela. STT local com faster-whisper na GPU.
 
-**Estado: funciona de ponta a ponta, com dois bugs abertos.** O bring-up em hardware foi feito
+**Estado: funciona de ponta a ponta, com um bug aberto (reticências).** O bring-up em hardware foi feito
 em 2026-09-17 na máquina original (Windows 11 Pro 26200, RTX 4060 Ti, Logitech PRO X).
 
 Leia `docs/ARCHITECTURE.md` antes de mexer em qualquer coisa. Tudo lá foi **medido**, não é
@@ -18,7 +18,7 @@ documentação copiada. `docs/CONTRACT.md` tem a API entre os módulos.
    hooks de teclado e injetou teclas enquanto ele jogava e atrapalhou tudo. Se você delegar para
    subagentes, **repita a regra dentro do prompt de cada um** — eles não herdam isso.
 2. O que é seguro rodar sozinho: `python -m py_compile`, e a suíte offline
-   `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (338 testes).
+   `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (342 testes).
    `tests/_safety.py` transforma `SendInput`, `SetWindowsHookExW` e `OpenClipboard` em bomba de
    `RuntimeError`, então a suíte é segura mesmo com alguém jogando.
 3. **Não lance o app de dentro de uma chamada de ferramenta comum** — o harness mata a árvore de
@@ -96,21 +96,16 @@ pontos. Verificado chamando a função direto:
 - **Meça o WER dos 3 fixtures antes e depois de qualquer mudança de decode.** Baseline atual:
   3,6% médio, `ptbr_short` e `ptbr_dev2` em 0,0%. Se regredir, volte atrás.
 
-### 2. `config.json` com BOM é ignorado inteiro, em silêncio
+### 2. `config.json` com BOM era ignorado inteiro, em silêncio — CORRIGIDO (2026-09-17)
 
-`config.load()` em `wispr/config.py` faz
-`json.loads(path.read_text(encoding="utf-8"))`. O `Out-File` do PowerShell e o Bloco de Notas
-gravam UTF-8 **com BOM** (`EF BB BF`), o `json.loads` estoura com "Expecting value: line 1
-column 1", o `except (OSError, ValueError)` engole, e o arquivo **inteiro** volta para os
-defaults sem nenhum aviso.
+O `Out-File` do PowerShell e o Bloco de Notas gravam UTF-8 **com BOM**, o `json.loads` estourava
+e o `except` engolia: o arquivo inteiro voltava aos defaults sem aviso. Custou um ciclo de teste
+(`{"log_level": "DEBUG"}` nunca ligou o DEBUG).
 
-Descoberto na prática: escrevemos `{"log_level": "DEBUG"}` para diagnosticar o bug 1 e o DEBUG
-nunca ligou — o que custou um ciclo de teste com o usuário.
-
-Correção: ler com `encoding="utf-8-sig"` (aceita com e sem BOM) **e** logar um WARNING quando o
-parse falhar, em vez de cair calado nos defaults. Tem teste em
-`tests/test_config.py` para "json corrompido cai nos defaults" — ele passa, e passaria também
-com a correção; adicione um caso específico de BOM.
+Agora `config.load()` lê com `utf-8-sig`, guarda o motivo de qualquer falha em
+`config.load_error`, e o `App.run()` reloga isso como WARNING depois de o logging subir (o
+primeiro `load()` roda antes do `logging_setup.setup()`, então logar só dentro do `load()` se
+perdia sob `pythonw`). Testes em `tests/test_config.py`, verificados por mutação.
 
 ## Suspeita não confirmada: ordem da cadeia de hooks
 
@@ -121,7 +116,7 @@ tecla, e que reinstalar nos jogue para a frente da cadeia.
 
 **Não está confirmado, e no último teste o `Win+A` funcionou sem nenhuma reinstalação** — então
 pode ter sido outra coisa. Se voltar a acontecer, o jeito de separar é o que preparamos e não
-chegamos a rodar: com o app em DEBUG (cuidado com o BOM!), deixe o teclado parado por mais de
+chegamos a rodar: com o app em DEBUG, deixe o teclado parado por mais de
 5 s mexendo só o mouse. Isso força a sonda de liveness, e o log diz uma de três coisas:
 `the hook is alive` (hook OK, a tecla some antes de chegar), `probe never reached the hook proc`
 (hook morreu mesmo) ou `the liveness probe cannot run now` (a sonda não pôde rodar — aí a
@@ -152,7 +147,7 @@ marcado com `PROBE_TAG`, ver `_probe_hook` em `wispr/hotkey.py`).
 ## Como está o repositório
 
 - `main` em `https://github.com/danieltanjos/wisper` (privado).
-- 338 testes offline, todos verificados por mutação — cada correção foi remutada em memória para
+- 342 testes offline, todos verificados por mutação — cada correção foi remutada em memória para
   provar que o teste fica vermelho sem ela. Mantenha esse padrão: a suíte anterior tinha 180
   testes verdes e **não pegou nenhum** dos defeitos que o hardware achou.
 - Três auditorias adversariais (contrato, concorrência, modos de falha) mais duas rodadas de

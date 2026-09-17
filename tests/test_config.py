@@ -234,6 +234,34 @@ class CorruptFileTest(unittest.TestCase):
         self.assertEqual(cfg["hotkey"], "ctrl+alt+a")
         self.assertEqual(cfg["engine"], config.DEFAULTS["engine"])
 
+    def test_utf8_bom_is_not_corruption(self):
+        """Bloco de Notas e Out-File gravam UTF-8 com BOM. Ignorar o arquivo
+        inteiro em silencio por causa disso custou um ciclo de teste."""
+        self.path.write_bytes(b'\xef\xbb\xbf{"log_level": "DEBUG"}')
+        cfg = config.load(self.path)
+        self.assertEqual(cfg["log_level"], "DEBUG")
+        self.assertIsNone(config.load_error)
+
+    def test_corrupt_file_is_reported_not_swallowed(self):
+        self.path.write_text('{"hotkey": "ctrl+alt+a"', encoding="utf-8")
+        with self.assertLogs("wispr.config", level="WARNING") as captured:
+            config.load(self.path)
+        self.assertIn("ignored", captured.output[0])
+        self.assertIn("JSONDecodeError", config.load_error)
+
+    def test_non_object_json_is_reported_too(self):
+        self.path.write_text("[1, 2, 3]", encoding="utf-8")
+        config.load(self.path)
+        self.assertIn("list", config.load_error)
+
+    def test_load_error_is_cleared_by_a_good_load(self):
+        self.path.write_text("nao e json", encoding="utf-8")
+        config.load(self.path)
+        self.assertIsNotNone(config.load_error)
+        self.path.write_text("{}", encoding="utf-8")
+        config.load(self.path)
+        self.assertIsNone(config.load_error)
+
 
 class SaveWritesOnlyTheDiffTest(unittest.TestCase):
 

@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "models"          # vira HF_HOME
@@ -24,6 +27,11 @@ os.environ.setdefault("HF_HOME", str(MODELS_DIR))
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 MUTEX_NAME = "Local\\WisprCloneDaniel"
+
+# Motivo do ultimo config.json ignorado, ou None. O App.run() reloga isso como
+# WARNING depois que o logging existe: o primeiro load() roda antes dele, e sob
+# pythonw o aviso emitido aqui nao tem para onde ir.
+load_error: str | None = None
 
 # Glossario SEM ACENTOS de proposito: a versao sem acentos mediu WER 8,5% contra
 # 9,8% da acentuada. Manter abaixo de 224 tokens ou o faster-whisper trunca e o
@@ -133,15 +141,22 @@ class Config(dict):
 def load(path: Path | None = None) -> Config:
     """Le config.json por cima dos defaults. Arquivo ausente ou corrompido nao
     derruba o app: ele volta aos defaults."""
+    global load_error
     path = Path(path) if path else CONFIG_PATH
     data = copy.deepcopy(DEFAULTS)
+    load_error = None
     if path.exists():
         try:
-            user = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(user, dict):
-                data.update(user)
-        except (OSError, ValueError):
-            pass
+            # utf-8-sig: Bloco de Notas e Out-File gravam UTF-8 COM BOM, e o
+            # json.loads estoura com "Expecting value: line 1 column 1" no BOM.
+            user = json.loads(path.read_text(encoding="utf-8-sig"))
+            if not isinstance(user, dict):
+                raise ValueError("top-level value is %s, expected an object"
+                                 % type(user).__name__)
+            data.update(user)
+        except (OSError, ValueError) as exc:
+            load_error = "%s: %s" % (type(exc).__name__, exc)
+            log.warning("%s ignored, using defaults: %s", path, load_error)
     return Config(data)
 
 
