@@ -73,6 +73,7 @@ NORMALIZE_DBFS = -3.0
 POLL_SEC = 0.5                                     # supervisor; recuperacao medida em 0,75 s
 BACKOFF_BASE = 0.5
 BACKOFF_MAX = 5.0                                  # device sumido de vez nao pode virar spin
+OPEN_GRACE_S = 1.0                                 # apos abrir, `written` parado nao e' morte
 MAX_XRUNS = 64                                     # deque limitada: o app fica semanas de pe
 SILENT_EVENT_MIN_S = 1.0                           # so o aviso e' limitado, nunca o gate
 
@@ -576,6 +577,7 @@ class Mic:
         self.on_demand = bool(self.cfg.get("mic_on_demand", True))
         self._wanted = not self.on_demand
         self._floor = 0
+        self._opened_t = 0.0
 
         opened = False
         if self.on_demand:
@@ -710,6 +712,7 @@ class Mic:
                                          dtype="float32", blocksize=self.block, latency="low",
                                          callback=self._cb)
         self.stream.start()
+        self._opened_t = time.monotonic()
         self.last_error = ""
 
     def _close_stream(self, abort: bool = False) -> None:
@@ -774,8 +777,8 @@ class Mic:
         """
         if not self.on_demand:
             return
-        self._wanted = True
         if _stream_active(self.stream, unknown=True):
+            self._wanted = True
             return
         try:
             with _portaudio(PA_LOCK_TIMEOUT) as got:
@@ -790,6 +793,10 @@ class Mic:
             raise
         self._floor = self.written
         self._dead = False
+        # So' AGORA o supervisor pode querer o stream: ligar antes do _open()
+        # abria uma janela em que ele via `stream is None`, declarava morte e
+        # disparava um _reopen() por cima da abertura em curso (visto ao vivo).
+        self._wanted = True
         self._emit_open()
 
     def stop(self) -> None:
@@ -913,8 +920,11 @@ class Mic:
                 err, self._cb_err = self._cb_err, ""
                 log.error("audio callback error: %s", err)
 
-            if not self._wanted:
+            if not self._wanted or time.monotonic() - self._opened_t < OPEN_GRACE_S:
                 # Sob demanda, fora de um ditado: nao ha stream e nao deve haver.
+                # E logo depois de abrir: um headset Bluetooth leva mais que uma
+                # ronda para entregar o primeiro bloco, e `written` parado nesse
+                # instante nao e' morte.
                 last = self.written
                 fails = 0
                 continue

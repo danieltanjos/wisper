@@ -2418,6 +2418,7 @@ class MicOnDemandTest(unittest.TestCase):
         mic = object.__new__(_audio.Mic)
         mic.sr, mic.block, mic.stream, mic.last_error = 48000, 480, None, ""
         mic.preroll_sec, mic.written, mic._floor = 0.35, 0, 0
+        mic._opened_t = 0.0
         mic.on_demand, mic._wanted, mic._dead = on_demand, not on_demand, False
         mic.reopens = mic.reopen_attempts = 0
         mic.device, mic.name, mic.hostapi, mic.fallback = -1, "", "", False
@@ -2480,6 +2481,23 @@ class MicOnDemandTest(unittest.TestCase):
                 mic.start()
         self.assertTrue(mic._dead)
         self.assertIsNone(mic.stream)
+        self.assertFalse(mic._wanted, "start() falhou: o supervisor nao pode querer stream")
+
+    def test_the_supervisor_gives_a_fresh_stream_a_grace_period(self):
+        # Visto ao vivo: Win+A, start() abre, e na primeira ronda o `written`
+        # ainda nao andou (Bluetooth demora) -> "stream_dead" e um _reopen() por
+        # cima do ditado. Logo depois de abrir, frames parados nao sao morte.
+        mic, sd, _ = self._mic()
+        reopens = []
+        mic._reopen = lambda: reopens.append(1) or True
+        with self._stack(sd):
+            mic.start()
+            t = threading.Thread(target=mic._supervise, daemon=True)
+            t.start()
+            time.sleep(0.08)                      # ~8 rondas com written parado
+            mic._stop.set()
+            t.join(1.0)
+        self.assertEqual(reopens, [], "supervisor reabriu um stream recem-aberto")
 
     def test_the_supervisor_does_not_reopen_while_idle(self):
         mic, sd, _ = self._mic()
