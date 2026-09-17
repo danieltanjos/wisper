@@ -61,6 +61,13 @@ lento (RTF 0,34 contra 0,055). Para nuvem em vez de CPU: `"engine": "groq"` no `
   com captura de tela dos quatro modos, não no ditado real.
 - A sonda de liveness do hook rodou aqui em DEBUG e disse `the hook is alive` — nesta máquina a
   cadeia de hooks não é problema.
+- **Velocidade na CPU: o custo é FIXO, 6,5–8 s por ditado, tanto para 4 s quanto para 12 s de
+  áudio.** É o encoder sobre a janela de 30 s. Tudo que foi medido e **não** ajuda (não repita):
+  `cpu_threads` 4/6/8/12 (o padrão 0 é o melhor; 4 só-P-cores é pior), `int16` (2x pior),
+  `int8_float32` (igual), `chunk_length` 20/15/10/6 (o CTranslate2 completa para 30 s por dentro:
+  tempo igual, WER piora, 6 alucina). Modelos: `small` 2,4 s mas WER 38% (79% com ruído);
+  `medium` mesma qualidade do turbo e quase o mesmo tempo. ISA: AVX2 só, sem AVX512/VNNI.
+  **Neste notebook a única saída para ~1 s é o Groq** (`engine: groq` + `GROQ_API_KEY`).
 
 ## O que está provado em hardware
 
