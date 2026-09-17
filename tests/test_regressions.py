@@ -2111,6 +2111,69 @@ class PunctuationRunGuardTest(unittest.TestCase):
                                           [["docker campus up", "docker compose up"]]),
                          "roda docker compose up")
 
+    # ------- o que vazou no segundo ditado em hardware (CLAUDE.md, bug 1) ----- #
+
+    def test_several_dot_groups_stacked_on_a_comma_all_go_away(self):
+        # O modelo devolve VARIOS grupos: a cauda solta corta a partir do espaco
+        # e sobra "Alo,..." -- que so' a regra empilhada limpa, e ela rodava ANTES.
+        self.assertEqual(self.guard("Alô," + "." * 20 + " " + "." * 15), "Alô,")
+        self.assertEqual(self.guard("Alô," + "." * 20 + " " + "." * 15 + " " + "." * 9),
+                         "Alô,")
+
+    def test_the_stacked_rule_still_runs_when_there_is_no_detached_tail(self):
+        self.assertEqual(self.guard("Oi," + "." * 51), "Oi,")
+
+    def test_a_punctuation_only_transcript_becomes_empty_on_the_contract_call(self):
+        # Uma linha inteira de pontos chegou no Bloco de Notas. Nao ha uma letra
+        # para censurar, entao a chamada de duas posicoes pode e deve esvaziar.
+        for junk in ("." * 40, ". . . . . . . .", "…", "?!", ",,,,"):
+            with self.subTest(junk=junk):
+                self.assertEqual(_stt.postprocess(junk, ()), "")
+
+    def test_a_single_letter_is_enough_to_keep_the_transcript(self):
+        self.assertEqual(_stt.postprocess("a", ()), "a")
+        self.assertEqual(_stt.postprocess("não", ()), "não")
+        self.assertEqual(_stt.postprocess("2", ()), "2")
+
+    def _engine_with_segments(self, texts):
+        import threading
+        import types
+
+        class FakeModel:
+            def transcribe(self, audio, **kw):
+                return ([types.SimpleNamespace(text=t, start=0.0, end=1.0) for t in texts], None)
+
+        eng = object.__new__(_stt.Engine)
+        eng.cfg = _config.load()
+        eng._lock = threading.Lock()
+        eng._decode = {}
+        eng._closed = False
+        eng.backend = "cpu"
+        eng.model = FakeModel()
+        eng.batched = None
+        return eng
+
+    def test_a_punctuation_only_segment_in_the_middle_is_dropped_before_the_join(self):
+        # Colado no meio nenhuma regra de cauda o alcanca: tem que sair antes.
+        import numpy as np
+
+        eng = self._engine_with_segments(["Alô,", "." * 30, "Isso de"])
+        self.assertEqual(eng._transcribe_local(np.zeros(16000, dtype=np.float32)),
+                         "Alô, Isso de")
+
+    def test_all_segments_punctuation_only_gives_an_empty_string(self):
+        import numpy as np
+
+        eng = self._engine_with_segments(["." * 30, ". . . ."])
+        self.assertEqual(eng._transcribe_local(np.zeros(16000, dtype=np.float32)), "")
+
+    def test_real_segments_are_joined_exactly_as_before(self):
+        import numpy as np
+
+        eng = self._engine_with_segments([" Sobe o container. ", "Depois confere os logs."])
+        self.assertEqual(eng._transcribe_local(np.zeros(16000, dtype=np.float32)),
+                         "Sobe o container. Depois confere os logs.")
+
 
 @unittest.skipUnless(_stt, _why_stt or "wispr.stt indisponivel")
 class TemperatureLadderTest(unittest.TestCase):

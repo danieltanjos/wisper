@@ -152,10 +152,13 @@ def _detached_tail_start(text: str) -> int:
 def strip_punct_runs(text: str) -> str:
     """Desarma corrida de pontuacao sem nunca encostar em texto legitimo."""
     out = _PUNCT_RUN_RE.sub(_collapse_punct_run, text)
-    out = _DOT_TAIL_STACKED_RE.sub("", out)
     start = _detached_tail_start(out)
     if start >= 0:
         out = out[:start]
+    # A cauda EMPILHADA vem DEPOIS da solta, de proposito: o modelo devolve varios
+    # grupos de pontos ("Alo,.... ...."), a solta corta so a partir do espaco e
+    # deixa "Alo,..." -- que e' exatamente a empilhada. Na ordem inversa vazava.
+    out = _DOT_TAIL_STACKED_RE.sub("", out)
     return out.strip()
 
 
@@ -282,6 +285,11 @@ def postprocess(text: str, fixups, *, single_short_segment: bool = False) -> str
     out = strip_punct_runs(out)
     if out != before:
         log.info("punctuation run collapsed: %r -> %r", before[:120], out[:120])
+    if out and not any(ch.isalnum() for ch in out):
+        # So pontuacao ("...", ". . .", "?!") nunca e' fala: e' o loop do decoder
+        # num clipe quase vazio. Nao e' censura -- nao ha uma letra para censurar.
+        log.info("dropped punctuation-only transcript: %r", out[:60])
+        return ""
     if single_short_segment and len(out) <= HALLUCINATION_MAX_CHARS and _is_hallucination(out):
         log.info("dropped hallucination on near-empty audio: %r", out)
         return ""
@@ -602,7 +610,16 @@ class Engine:
         if not items:
             log.info("stt empty backend=%s dur=%.1fs t=%.2fs", self.backend, dur, took)
             return ""
-        text = " ".join(str(seg.text).strip() for seg in items).strip()
+        # Segmento sem uma letra ou digito sequer e' o decoder em loop de "."
+        # (medido: e' um segmento A MAIS ao lado da fala real, nao o clipe inteiro,
+        # por isso no_speech_prob volta 0,0). Sai ANTES do join: colado no meio
+        # ("Alo, .... Isso de") nenhuma regra de cauda o alcancaria.
+        texts = [str(seg.text).strip() for seg in items]
+        kept = [t for t in texts if any(ch.isalnum() for ch in t)]
+        if len(kept) != len(texts):
+            log.info("dropped %d punctuation-only segment(s): %r",
+                     len(texts) - len(kept), [t[:40] for t in texts if t not in kept])
+        text = " ".join(kept).strip()
         seg_s = float(getattr(items[0], "end", 0.0) or 0.0) - float(getattr(items[0], "start", 0.0) or 0.0)
         single_short = len(items) == 1 and seg_s <= HALLUCINATION_MAX_SEC
         out = postprocess(text, self.cfg.get("fixups"), single_short_segment=single_short)

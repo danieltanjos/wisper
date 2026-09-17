@@ -18,7 +18,7 @@ documentação copiada. `docs/CONTRACT.md` tem a API entre os módulos.
    hooks de teclado e injetou teclas enquanto ele jogava e atrapalhou tudo. Se você delegar para
    subagentes, **repita a regra dentro do prompt de cada um** — eles não herdam isso.
 2. O que é seguro rodar sozinho: `python -m py_compile`, e a suíte offline
-   `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (342 testes).
+   `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (349 testes).
    `tests/_safety.py` transforma `SendInput`, `SetWindowsHookExW` e `OpenClipboard` em bomba de
    `RuntimeError`, então a suíte é segura mesmo com alguém jogando.
 3. **Não lance o app de dentro de uma chamada de ferramenta comum** — o harness mata a árvore de
@@ -57,44 +57,34 @@ Medido, não inferido:
 | shutdown | fecha engine, overlay e bandeja sem travar |
 | ditado completo | `Win+A` → fala → `Enter` → texto no Bloco de Notas |
 
-## BUGS ABERTOS
+## BUGS
 
-### 1. Reticências no texto entregue (o que estávamos caçando)
+### 1. Reticências no texto entregue — CORRIGIDO no código (2026-09-17), falta confirmar ao vivo
 
 **Sintoma real, com o app rodando:** o usuário ditou três vezes e recebeu no Bloco de Notas
 `asasAlô,....................`, depois uma linha inteira de pontos, depois `Isso de`.
-Sessões no log: 65 chars e 80 chars, ambas `mode=type`.
 
-**O que já foi feito (e não bastou):**
-- A escada de temperatura foi desligada (`temperature=[0.0]`, `GREEDY_ONLY`). A causa raiz medida
-  é real — `generate_with_fallback` (faster_whisper/transcribe.py:1479-1530) passa a **sortear**
-  até T=1,0 quando o `avg_logprob` do greedy cai abaixo de -1,0, o que acontece sempre que um
-  ditado curto deixa a janela de 30 s quase vazia, e depois compara amostras de temperaturas
-  diferentes por um score que não é comparável entre elas. Isso também deixou o decode
-  determinístico e **2,6x mais rápido**, então vale manter de qualquer forma.
-- Um guard conservador em `postprocess()` (`strip_punct_runs`, em `wispr/stt.py`).
+**Causa raiz (duas):** a escada de temperatura, já desligada (`GREEDY_ONLY`, decode determinístico
+e 2,6x mais rápido, manter), e o decoder destilado do turbo entrando em loop de `.` quando a
+janela de 30 s tem pouca fala. O cinto `strip_punct_runs` existia, mas vazava por dois furos:
 
-**Por que ainda vaza — o diagnóstico que faltava:** o guard limpa **uma** cauda de pontos, mas o
-`_transcribe_local` junta os segmentos com `" ".join()`, e o modelo devolve **vários** grupos de
-pontos. Verificado chamando a função direto:
+1. Rodava a regra de cauda **empilhada** (`Oi,...` → `Oi,`) **antes** da cauda **solta**. Com
+   vários grupos de pontos (`Alô,.... ....`) a solta corta só a partir do espaço e sobra
+   `Alô,...`, que é exatamente o caso da empilhada — que já tinha passado. Agora a ordem é
+   colapso → solta → empilhada.
+2. Um segmento só de pontos **no meio** da lista (`["Alô,", "....", "Isso de"]`) nunca é cauda.
+   `_transcribe_local` agora descarta, antes do join, qualquer segmento sem letra ou dígito; e
+   `postprocess()` devolve `""` para texto sem nenhuma letra ou dígito (não é censura: não há o
+   que censurar). O caminho `groq` passa pelo mesmo `postprocess`.
 
-```
-'Alô,....................'                   -> 'Alô,'      OK
-'Alô,.................... ...............'   -> 'Alô,...'   SOBRA
-'........................................'   -> '...'       SOBRA
-```
+Sete testes em `tests/test_regressions.py` (`PunctuationRunGuardTest`), três mutantes remutados
+em memória, todos vermelhos. **WER idêntico antes e depois** (0,0 / 10,7 / 0,0; média 3,6%),
+medido com `tests/bench_wer.py` — não é `test_*` de propósito, ele carrega o modelo.
 
-**Por onde começar amanhã:**
-- O caminho mais promissor é **antes do join**: descartar o segmento inteiro quando ele não tem
-  nenhuma letra ou dígito, em `_transcribe_local`, em vez de tentar limpar a string colada.
-  Isso mata o caso de vários grupos de uma vez e é mais fácil de provar seguro.
-- Vale olhar de novo `no_speech_threshold` e `log_prob_threshold` por segmento: nos casos
-  medidos o `no_speech_prob` voltou 0,000 porque **há** fala real no clipe — o segmento de
-  pontos é um segmento *adicional*, não o clipe inteiro.
-- `logs/recordings/*.wav` tem gravações reais salvas (ligue `"keep_recordings": true`). Dá para
-  iterar offline, sem pedir nada ao usuário. Os controles limpos de 8 s estão lá.
-- **Meça o WER dos 3 fixtures antes e depois de qualquer mudança de decode.** Baseline atual:
-  3,6% médio, `ptbr_short` e `ptbr_dev2` em 0,0%. Se regredir, volte atrás.
+**O que falta:** ditar de verdade e ver no Bloco de Notas. Se voltar a vazar, `keep_recordings`
+salva o wav em `logs/recordings/` e o `bench_wer.py` mostra como carregar um clipe pelo `Engine`.
+
+### 2. `config.json` com BOM era ignorado inteiro, em silêncio — CORRIGIDO (2026-09-17)
 
 ### 2. `config.json` com BOM era ignorado inteiro, em silêncio — CORRIGIDO (2026-09-17)
 
@@ -147,7 +137,7 @@ marcado com `PROBE_TAG`, ver `_probe_hook` em `wispr/hotkey.py`).
 ## Como está o repositório
 
 - `main` em `https://github.com/danieltanjos/wisper` (privado).
-- 342 testes offline, todos verificados por mutação — cada correção foi remutada em memória para
+- 349 testes offline, todos verificados por mutação — cada correção foi remutada em memória para
   provar que o teste fica vermelho sem ela. Mantenha esse padrão: a suíte anterior tinha 180
   testes verdes e **não pegou nenhum** dos defeitos que o hardware achou.
 - Três auditorias adversariais (contrato, concorrência, modos de falha) mais duas rodadas de
