@@ -119,6 +119,7 @@ DEFAULTS = {
 
     # --- interface ---
     "overlay": True,
+    "overlay_idle_pill": True,      # traco cinza no rodape entre ditados, como a Flow Bar
     "overlay_offset_y": 110,
     "sounds": True,
     "notify_on_error": True,

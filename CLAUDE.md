@@ -54,8 +54,11 @@ lento (RTF 0,34 contra 0,055). Para nuvem em vez de CPU: `"engine": "groq"` no `
   pré-roll. `docs/ARCHITECTURE.md` seção 4 tem o desenho (`start()`/`stop()`, piso do `mark()`,
   trava `_wanted` no supervisor). Falta confirmar ao vivo que o ícone de microfone some entre
   ditados e que a primeira sílaba não é cortada.
-- **Pílula** redesenhada a pedido: preto, ondas brancas, 110x26 em vez de 240x54
-  (`wispr/overlay.py`, constantes no topo). Não foi vista ao vivo ainda.
+- **Pílula = Flow Bar do Wispr Flow**, copiada do vídeo em wisprflow.ai: preta, contorno claro
+  fino, 11 barras brancas de ponta redonda que descansam como pontos, 100x36. Transcrevendo é uma
+  onda varrendo as barras (sem texto, sem spinner). Entre ditados fica um traço cinza de 44x8 no
+  rodapé (`overlay_idle_pill: false` tira). Constantes no topo de `wispr/overlay.py`. Conferido
+  com captura de tela dos quatro modos, não no ditado real.
 - A sonda de liveness do hook rodou aqui em DEBUG e disse `the hook is alive` — nesta máquina a
   cadeia de hooks não é problema.
 

@@ -273,20 +273,25 @@ def _primary_size(fallback_w: int, fallback_h: int) -> tuple[int, int]:
 # Magenta é a cor-chave do -transparentcolor: cada pixel dessa cor vira um
 # buraco 100% transparente na janela. Nada do desenho pode usá-la.
 _KEY = "#ff00ff"
-# Preto com ondas brancas, e pequena: a pilula original (240x54) era gigante.
+# A Flow Bar do Wispr Flow, copiada do video do site (2026-09-17): pilula preta
+# com contorno claro fino, 11 barras brancas de pontas redondas que descansam
+# como pontos, e um traco cinza minusculo no lugar dela quando ocioso.
 _BG = "#000000"
-_EDGE = "#3a3a3a"
+_EDGE = "#e9e6dc"
 _BAR = "#ffffff"
 _SPIN = "#ffffff"
 _TXT = "#ffffff"
+_IDLE = "#6f6f6f"
 
-_BASE_W = 110
-_BASE_H = 26
-_NBARS = 9
+_BASE_W = 100
+_BASE_H = 36
+_NBARS = 11
 _BAR_W = 3
-_BAR_GAP = 4
+_BAR_GAP = 3
 _FONT_PX = 11
 _SPIN_R = 7
+_IDLE_W = 44
+_IDLE_H = 8
 
 _LABEL_WORK = "transcrevendo…"
 _TICK_MS = 33
@@ -380,11 +385,16 @@ class Overlay:
         # Estado compartilhado entre threads. Escrita de chave em dict é atômica
         # sob a GIL, e é o único canal que temos para falar com a thread Tk.
         # Só os métodos públicos escrevem aqui; o tick apenas lê.
+        # Traco cinza ocioso, como a Flow Bar. `overlay_idle_pill: false` esconde.
+        try:
+            self._idle = bool(self.cfg.get("overlay_idle_pill", True))
+        except Exception:
+            self._idle = True
         self._st = {
-            "mode": "",        # "" | "rec" | "work" | "msg"
+            "mode": "idle" if self._idle else "",   # "" | "idle" | "rec" | "work" | "msg"
             "text": "",
             "level": 0.0,
-            "visible": False,
+            "visible": self._idle,
             "msg_until": 0.0,
             "quit": False,
         }
@@ -482,10 +492,11 @@ class Overlay:
         self._st["level"] = rms
 
     def hide(self) -> None:
+        """Fim de ditado: volta ao traco ocioso (ou some, sem ele)."""
         st = self._st
-        st["visible"] = False
-        st["mode"] = ""
         st["msg_until"] = 0.0
+        st["mode"] = "idle" if self._idle else ""
+        st["visible"] = self._idle
 
     def stop(self) -> None:
         self._st["quit"] = True
@@ -614,7 +625,9 @@ class Overlay:
         self._bars_w = _NBARS * self._bw + (_NBARS - 1) * self._gap
         self._spin_r = max(5, int(round(_SPIN_R * s)))
         self._bar_min = max(1.5, 1.5 * s)
-        self._bar_max = max(self._bar_min + 2.0, self._h / 2.0 - max(3.0, 4.0 * s))
+        self._bar_max = max(self._bar_min + 2.0, self._h / 2.0 - max(6.0, 7.0 * s))
+        self._idle_w = int(round(_IDLE_W * s))
+        self._idle_h = max(4, int(round(_IDLE_H * s)))
         # perfil de altura: barras do meio mais altas, como num medidor real
         self._bar_shape = [0.55 + 0.45 * math.cos((i - (_NBARS - 1) / 2.0) * math.pi / _NBARS)
                            for i in range(_NBARS)]
@@ -663,26 +676,21 @@ class Overlay:
         # a pílula seria redesenhada e reposicionada 30x por segundo.
         key = (mode, text, self._scale, self._sw, self._sh)
 
-        cv, s, H = self._cv, self._scale, self._h
+        cv, s = self._cv, self._scale
+        H = self._idle_h if mode == "idle" else self._h
         r = H // 2
-        rs = self._spin_r
-        gap_txt = int(round(10 * s))
 
         max_inner = max(60, int(self._sw * 0.8) - 2 * r)
-        if mode == "work":
-            max_inner = max(40, max_inner - (2 * rs + gap_txt))
-        if mode in ("work", "msg"):
+        if mode == "msg":
             text = self._tk_fit(text, max_inner)
         tw = self._font.measure(text) if (text and self._font is not None) else 0
 
-        if mode == "work":
-            inner = 2 * rs + gap_txt + tw
-        elif mode == "msg":
-            inner = tw
+        if mode == "idle":
+            W = self._idle_w
         else:
-            inner = self._bars_w
-        W = max(self._base_w, inner + 2 * r)
-        W = min(W, max(self._base_w, int(self._sw * 0.9)))
+            inner = tw if mode == "msg" else self._bars_w
+            W = max(self._base_w, inner + 2 * r)
+            W = min(W, max(self._base_w, int(self._sw * 0.9)))
 
         cv.delete("all")
         cv.configure(width=W, height=H)
@@ -690,31 +698,29 @@ class Overlay:
 
         # Tk não tem retângulo arredondado: a cápsula é dois círculos + um
         # retângulo. A borda é uma cápsula clara com outra escura por cima.
-        b = max(1, int(round(1.5 * s)))
-        cv.create_oval(0, 0, H, H, fill=_EDGE, outline="")
-        cv.create_oval(W - H, 0, W, H, fill=_EDGE, outline="")
-        cv.create_rectangle(r, 0, W - r, H, fill=_EDGE, outline="")
-        cv.create_oval(b, b, H - b, H - b, fill=_BG, outline="")
-        cv.create_oval(W - H + b, b, W - b, H - b, fill=_BG, outline="")
-        cv.create_rectangle(r, b, W - r, H - b, fill=_BG, outline="")
+        # Ociosa: um traço cinza chapado, sem contorno, como a Flow Bar.
+        edge, fill = (_IDLE, _IDLE) if mode == "idle" else (_EDGE, _BG)
+        b = 0 if mode == "idle" else max(1, int(round(1.5 * s)))
+        cv.create_oval(0, 0, H, H, fill=edge, outline="")
+        cv.create_oval(W - H, 0, W, H, fill=edge, outline="")
+        cv.create_rectangle(r, 0, W - r, H, fill=edge, outline="")
+        if b:
+            cv.create_oval(b, b, H - b, H - b, fill=fill, outline="")
+            cv.create_oval(W - H + b, b, W - b, H - b, fill=fill, outline="")
+            cv.create_rectangle(r, b, W - r, H - b, fill=fill, outline="")
 
         cy = H / 2.0
-        if mode == "rec":
-            x0 = (W - self._bars_w) // 2
+        if mode in ("rec", "work"):
+            # Barras como LINHAS com ponta redonda: e' o que da' o visual de
+            # pilulinhas do Wispr; em repouso viram pontos. `x` e' o centro.
+            x0 = (W - self._bars_w) // 2 + self._bw / 2.0
             for i in range(_NBARS):
                 x = x0 + i * (self._bw + self._gap)
                 self._bar_x.append(x)
-                self._bars.append(cv.create_rectangle(
-                    x, cy - self._bar_min, x + self._bw, cy + self._bar_min,
-                    fill=_BAR, outline=""))
+                self._bars.append(cv.create_line(
+                    x, cy - self._bar_min, x, cy + self._bar_min,
+                    fill=_BAR, width=self._bw, capstyle="round"))
             self._bar_a = [self._bar_min] * _NBARS
-        elif mode == "work":
-            gx = (W - inner) / 2.0
-            self._arc = cv.create_arc(gx, cy - rs, gx + 2 * rs, cy + rs,
-                                      start=0, extent=110, style=self._tkmod.ARC,
-                                      outline=_SPIN, width=max(2, int(round(2.5 * s))))
-            self._label = cv.create_text(gx + 2 * rs + gap_txt, cy, text=text,
-                                         fill=_TXT, font=self._font, anchor="w")
         elif mode == "msg":
             self._label = cv.create_text(W / 2.0, cy, text=text, fill=_TXT,
                                          font=self._font, anchor="center")
@@ -825,7 +831,7 @@ class Overlay:
                 if mode == "rec":
                     self._tk_anim_bars(st)
                 elif mode == "work":
-                    self._tk_anim_spinner()
+                    self._tk_anim_wave()
         except Exception:
             # Um frame perdido não pode matar o loop: sem mainloop a pílula
             # congela na tela por cima de tudo.
@@ -858,14 +864,17 @@ class Overlay:
             self._bar_a[i] += (want - self._bar_a[i]) * 0.5
             h = self._bar_a[i]
             x = self._bar_x[i]
-            cv.coords(item, x, cy - h, x + self._bw, cy + h)
+            cv.coords(item, x, cy - h, x, cy + h)
 
-    def _tk_anim_spinner(self) -> None:
-        if self._arc is None:
-            return
-        start = (-self._frame * 9) % 360
-        extent = 70 + 60 * (0.5 + 0.5 * math.sin(self._frame * 0.11))
-        self._cv.itemconfigure(self._arc, start=start, extent=extent)
+    def _tk_anim_wave(self) -> None:
+        """Transcrevendo: uma onda varre as barras da esquerda para a direita,
+        o "shimmer" da Flow Bar. Sem texto, sem spinner."""
+        cv, cy = self._cv, self._h / 2.0
+        span = (self._bar_max - self._bar_min) * 0.6
+        for i, item in enumerate(self._bars):
+            h = self._bar_min + span * (0.5 + 0.5 * math.sin(self._frame * 0.22 - i * 0.55))
+            x = self._bar_x[i]
+            cv.coords(item, x, cy - h, x, cy + h)
 
 
 # --------------------------------------------------------------------------
