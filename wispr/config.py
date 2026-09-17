@@ -119,7 +119,7 @@ DEFAULTS = {
 
     # --- interface ---
     "overlay": True,
-    "overlay_idle_pill": True,      # traco cinza no rodape entre ditados, como a Flow Bar
+    "overlay_idle_pill": False,     # traco cinza no rodape entre ditados (o usuario dispensou)
     "overlay_offset_y": 8,          # px acima da barra de tarefas (area de trabalho)
     "sounds": False,                # pedido do usuario: nenhum bip; a pilula ja avisa
     "notify_on_error": True,

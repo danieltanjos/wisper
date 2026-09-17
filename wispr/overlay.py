@@ -310,11 +310,11 @@ _FONT_PX = 11
 _SPIN_R = 8
 _IDLE_W = 36
 _IDLE_H = 6
-_ANIM_FRAMES = 8      # ~260 ms de transicao de tamanho entre modos
-_SLIDE_FRAMES = 12    # ~0,4 s: entra subindo de baixo da tela (rapido -> freia), sai ao contrario
+_ANIM_S = 0.26        # transicao de tamanho entre modos
+_SLIDE_S = 0.4        # entra subindo de baixo da tela (rapido -> freia), sai ao contrario
 
 _LABEL_WORK = "transcrevendo…"
-_TICK_MS = 33
+_TICK_MS = 16         # 60 fps; o tick reagenda por PRAZO, nao por "16 ms depois de terminar"
 _MSG_MAX_CHARS = 200
 
 
@@ -407,9 +407,9 @@ class Overlay:
         # Só os métodos públicos escrevem aqui; o tick apenas lê.
         # Traco cinza ocioso, como a Flow Bar. `overlay_idle_pill: false` esconde.
         try:
-            self._idle = bool(self.cfg.get("overlay_idle_pill", True))
+            self._idle = bool(self.cfg.get("overlay_idle_pill", False))
         except Exception:
-            self._idle = True
+            self._idle = False
         self._st = {
             "mode": "idle" if self._idle else "",   # "" | "idle" | "rec" | "work" | "msg"
             "text": "",
@@ -431,7 +431,8 @@ class Overlay:
         self._lay_key = None
         self._geom = None
         self._anim = None     # (frame0, w0, h0, w1, h1) durante a transicao de tamanho
-        self._slide = None    # (frame0, +1 entrando | -1 saindo) durante o deslize vertical
+        self._slide = None    # (t0, +1 entrando | -1 saindo) durante o deslize vertical
+        self._next_t = 0.0    # prazo do proximo tick (monotonic)
         self._scale = 1.0
         self._dpi = 96
         self._sw = 1920
@@ -611,6 +612,7 @@ class Overlay:
 
             self.alive = True
             self._ready.set()
+            self._next_t = time.monotonic()
             root.after(_TICK_MS, self._tk_tick)
             root.mainloop()
             log.info("overlay mainloop encerrado")
@@ -784,11 +786,13 @@ class Overlay:
         # abaixo revelaria a pílula no tamanho e na posição antigos por um frame.
         # update_idletasks() (e não update()) não reentra no tick: ele processa
         # só eventos ociosos, nunca timers.
-        try:
-            self._root.update_idletasks()
-        except Exception:
-            log.debug("overlay: update_idletasks apos geometry falhou", exc_info=True)
         if size is None:
+            # So' no quadro final: nos intermediarios o mainloop ja' aplica a
+            # geometria entre dois ticks, e forcar aqui custava o frame inteiro.
+            try:
+                self._root.update_idletasks()
+            except Exception:
+                log.debug("overlay: update_idletasks apos geometry falhou", exc_info=True)
             self._lay_key = key
         return target
 
@@ -835,7 +839,7 @@ class Overlay:
         """(y da janela neste quadro do deslize, acabou?). Só com `_slide` ativo."""
         f0, direction = self._slide
         x, y, w, h = self._geom
-        t = min(1.0, (self._frame - f0) / float(_SLIDE_FRAMES))
+        t = min(1.0, (time.monotonic() - f0) / _SLIDE_S)
         below = max(0, self._sh - y)              # distância até sumir sob a base da tela
         if direction > 0:
             dy = below * (1.0 - t) ** 3           # entrando: rápido, depois freia
@@ -870,7 +874,7 @@ class Overlay:
         try:
             self._frame += 1
 
-            if self._frame % 15 == 0:            # ~0,5 s
+            if self._frame % 30 == 0:            # ~0,5 s a 60 fps
                 self._tk_check_screen()
 
             # Leitura única e sem escrita: o tick nunca mexe no dict, senão
@@ -894,14 +898,14 @@ class Overlay:
                     tgt = self._tk_layout(mode, text)
                     if prev is not None and self._vis and mode != "msg":
                         # Ja' havia uma capsula na tela: em vez de pular de
-                        # tamanho, ela escorrega ate' o novo em _ANIM_FRAMES.
-                        self._anim = (self._frame, prev[2], prev[3], tgt[0], tgt[1])
+                        # tamanho, ela escorrega ate' o novo em _ANIM_S.
+                        self._anim = (time.monotonic(), prev[2], prev[3], tgt[0], tgt[1])
                         self._tk_layout(mode, text, size=(prev[2], prev[3]))
                     else:
                         self._anim = None
                 if self._anim is not None:
                     f0, w0, h0, w1, h1 = self._anim
-                    t = min(1.0, (self._frame - f0) / float(_ANIM_FRAMES))
+                    t = min(1.0, (time.monotonic() - f0) / _ANIM_S)
                     e = 1.0 - (1.0 - t) ** 3            # ease-out
                     if t >= 1.0:
                         self._anim = None
@@ -913,10 +917,10 @@ class Overlay:
                 self._anim = None
 
             if want and not self._vis:
-                self._slide = (self._frame, +1)
+                self._slide = (time.monotonic(), +1)
                 self._tk_reveal()
             elif not want and self._vis and (self._slide is None or self._slide[1] > 0):
-                self._slide = (self._frame, -1)   # desce antes de sumir
+                self._slide = (time.monotonic(), -1)   # desce antes de sumir
 
             if self._slide is not None and self._vis:
                 y, done = self._slide_y()
@@ -936,8 +940,18 @@ class Overlay:
             # Um frame perdido não pode matar o loop: sem mainloop a pílula
             # congela na tela por cima de tudo.
             log.exception("overlay tick falhou")
+        # Reagenda pelo PRAZO do proximo quadro, descontando o que este tick
+        # gastou. `after(16)` contado do fim do tick dava 16 ms + o custo do
+        # quadro, e nas transicoes (geometria + redesenho) isso caia para 20 fps
+        # e parecia travado. Se ficou muito para tras, ressincroniza em vez de
+        # disparar uma rajada.
+        now = time.monotonic()
+        self._next_t += _TICK_MS / 1000.0
+        if self._next_t < now - 0.1:
+            self._next_t = now
+        delay = max(1, int(round((self._next_t - now) * 1000)))
         try:
-            self._root.after(_TICK_MS, self._tk_tick)
+            self._root.after(delay, self._tk_tick)
         except Exception:
             # Sem reagendamento não há mais quem esconda a pílula nem quem leia
             # o "quit": sumir e derrubar o mainloop é melhor que congelar.
@@ -959,7 +973,7 @@ class Overlay:
         cv, cy = self._cv, self._h / 2.0
         span = self._bar_max - self._bar_min
         for i, item in enumerate(self._bars):
-            osc = 0.55 + 0.45 * math.sin(self._frame * 0.26 + i * 0.85)
+            osc = 0.55 + 0.45 * math.sin(time.monotonic() * 8.0 + i * 0.85)
             want = self._bar_min + span * cur * self._bar_shape[i] * osc
             self._bar_a[i] += (want - self._bar_a[i]) * 0.5
             h = self._bar_a[i]
@@ -969,8 +983,9 @@ class Overlay:
     def _tk_anim_spinner(self) -> None:
         if self._arc is None:
             return
-        start = (-self._frame * 9) % 360
-        extent = 70 + 60 * (0.5 + 0.5 * math.sin(self._frame * 0.11))
+        now = time.monotonic()
+        start = (-now * 270.0) % 360
+        extent = 70 + 60 * (0.5 + 0.5 * math.sin(now * 3.3))
         self._cv.itemconfigure(self._arc, start=start, extent=extent)
 
 
