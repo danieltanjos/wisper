@@ -67,6 +67,13 @@ DEFAULTS = {
     "initial_prompt": DEFAULT_PROMPT,
     "fixups": DEFAULT_FIXUPS,
     "vad_filter": True,
+    # Escada de temperatura do Whisper (0,0 -> 1,0) DESLIGADA. Num ditado curto o
+    # avg_logprob do decode greedy cai abaixo do log_prob_threshold e o
+    # faster-whisper passa a SORTEAR ate' temperatura 1,0; foi de la que sairam as
+    # corridas de pontos ("Oi," seguido de 51 pontos). Ligar devolve o
+    # comportamento original do faster-whisper, e com ele o mesmo audio pode dar
+    # textos diferentes a cada tentativa. Ver docs/ARCHITECTURE.md secao 2.
+    "temperature_fallback": False,
     "preload_model": True,          # carrega o modelo no boot em vez do 1o Win+A
     "groq_model": "whisper-large-v3-turbo",
     "groq_api_key": "",             # vazio => le da env GROQ_API_KEY

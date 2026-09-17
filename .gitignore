@@ -45,3 +45,6 @@ dist/
 .vscode/
 .idea/
 Thumbs.db
+
+# Icones da bandeja, gravados em runtime no primeiro boot.
+/assets/

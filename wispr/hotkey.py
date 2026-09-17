@@ -11,7 +11,9 @@ Três threads saem daqui:
   - hook    : instala o `WH_KEYBOARD_LL` e bombeia `GetMessageW` (o hook precisa de
               uma thread com fila de mensagens, senão o Windows o despeja);
   - worker  : tira eventos da fila e chama os callbacks do app;
-  - watchdog: detecta hook despejado em silêncio e manda reinstalar.
+  - watchdog: detecta hook despejado em silêncio e manda reinstalar — só depois
+              de PROVAR, com uma sonda injetada, que o hook parou de receber
+              eventos (`_probe_hook`); silêncio sozinho não é prova.
 
 O hook proc em si só seta flags e faz `queue.put()`. Orçamento medido: 0,017 ms
 de custo médio contra 300 ms de `LowLevelHooksTimeout` default.
@@ -52,13 +54,20 @@ VK_RMENU = 0xA5                      # AltGr chega como LCtrl sintético + este
 # import entre hotkey.py e inject.py (start() confere os dois em tempo de execução).
 MASK_TAG = 0x57495352
 INJECT_TAG = 0x57495350
-IGNORED_TAGS = frozenset({MASK_TAG, INJECT_TAG})
+PROBE_TAG = 0x57495353               # sonda de liveness do watchdog, ver _probe_hook()
+IGNORED_TAGS = frozenset({MASK_TAG, INJECT_TAG, PROBE_TAG})
 
 # watchdog
 WATCHDOG_PERIOD_S = 3.0
 WATCHDOG_MAX_PERIOD_S = 60.0         # teto do backoff quando a instalação falha em série
+# INPUT_RECENT_MS e HOOK_SILENT_S formam a SUSPEITA, nunca o diagnóstico:
+# `GetLastInputInfo` devolve o último input de teclado **ou mouse** e um
+# `WH_KEYBOARD_LL` jamais dispara em evento de mouse, então cinco segundos de
+# mouse sem teclado batem nos dois limites com o hook perfeitamente vivo. Quem
+# decide é a sonda de _probe_hook().
 INPUT_RECENT_MS = 1500               # o SO viu input há menos disso...
 HOOK_SILENT_S = 5.0                  # ...mas nosso hook proc não dispara há mais disso
+HOOK_PROBE_TIMEOUT_S = 0.15          # espera pela sonda; o hook proc custa 0,017 ms
 HOOK_FAIL_ALERT = 3                  # falhas seguidas até avisar o app (uma vez por série)
 
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
@@ -148,18 +157,22 @@ log = _get_logger()
 _INPUT_SIZE = ctypes.sizeof(INPUT)      # 40 em x64, ver docs/ARCHITECTURE.md seção 5
 
 
-def _build_mask_inputs() -> ctypes.Array:
+def _build_tap_inputs(vk: int, tag: int) -> ctypes.Array:
+    """`INPUT[2]` com o down+up de uma tecla, marcado com uma das nossas tags."""
     arr = (INPUT * 2)()
     for i, flags in enumerate((0, KEYEVENTF_KEYUP)):
         arr[i].type = INPUT_KEYBOARD
-        arr[i].u.ki = KEYBDINPUT(wVk=VK_MASK, wScan=0, dwFlags=flags, time=0,
-                                 dwExtraInfo=MASK_TAG)
+        arr[i].u.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0,
+                                 dwExtraInfo=tag)
     return arr
 
 
-# Montado uma única vez no import: quem chama _tap_mask() é o hook proc, e alocar
+# Montados uma única vez no import: quem chama _tap_mask() é o hook proc, e alocar
 # structs no caminho quente é justamente o tipo de trabalho que estoura o orçamento.
-_MASK_INPUTS = _build_mask_inputs()
+# A sonda usa a MESMA tecla da máscara com tag própria — só a tag separa "desarmar
+# o menu Iniciar" de "provar que o hook está vivo".
+_MASK_INPUTS = _build_tap_inputs(VK_MASK, MASK_TAG)
+_PROBE_INPUTS = _build_tap_inputs(VK_MASK, PROBE_TAG)
 
 
 def _tap_mask() -> None:
@@ -249,6 +262,37 @@ def is_elevated() -> bool:
             k32.CloseHandle(token)
     except Exception:
         log.exception("is_elevated() failed")
+        return False
+
+
+def _uipi_drops_injection() -> bool:
+    """O UIPI vai engolir em silêncio o que injetarmos agora?
+
+    Importa para a sonda de liveness: com uma janela elevada em foco e nós sem
+    elevação, o `SendInput` some no caminho com `GetLastError() == 0`
+    (ARCHITECTURE.md seção 5) **e** o hook não recebe evento nenhum (seção 3).
+    Uma sonda perdida nesse cenário não prova que o hook morreu, e reinstalar não
+    devolveria os eventos — é preciso saber disso antes de injetar.
+
+    Delega em vez de reimplementar: `inject.injection_blocked()` já é a resposta
+    ACIONÁVEL do CONTRACT.md ("o alvo está elevado E nós não"). A resposta crua
+    viraria alarme falso justamente no cenário recomendado da seção 6, com o
+    wisper rodando elevado. O import é tardio pelo mesmo motivo de
+    `_check_inject_tag()`: no topo do arquivo criaria ciclo com inject.py.
+
+    Só `True` segura a sonda; `False` e `None` ("não deu para saber") seguem em
+    frente, porque tratar o desconhecido como bloqueio devolveria o bug ao
+    contrário — um hook realmente despejado nunca mais seria reinstalado.
+    """
+    if is_elevated():
+        # Ninguém está acima de nós: o UIPI não tem o que descartar.
+        return False
+    try:
+        from wispr import inject
+        return inject.injection_blocked() is True
+    except Exception:
+        log.debug("could not ask wispr.inject whether UIPI would drop the probe",
+                  exc_info=True)
         return False
 
 
@@ -342,6 +386,12 @@ class HotkeyEngine:
         self._error_sent = False        # on_error já disparou para ESTA série
         self._last_error = ""
         self._pending = False           # um "start" entregue ao app e ainda em execução
+        # Sonda de liveness. Só o watchdog escreve em `_probe_pending`, e só
+        # enquanto uma sonda está no ar: o hook proc lê esse booleano antes de
+        # tocar no Event, para que uma sonda atrasada de um ciclo anterior não
+        # responda pela sonda de agora.
+        self._probe_pending = False
+        self._probe_seen = threading.Event()
         self._ready = threading.Event()
         self._stopping = threading.Event()
         # Um único lock, pequeno: serializa nascimento da thread do hook contra o
@@ -375,9 +425,22 @@ class HotkeyEngine:
             if nCode == HC_ACTION:
                 self._last_fire = time.monotonic()      # sinal de vida para o watchdog
                 kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                tag = kb.dwExtraInfo
+                if tag == PROBE_TAG:
+                    # Sonda do watchdog. Sair AQUI, antes de qualquer lógica de
+                    # chord, é o que garante que ela nunca vire um "start" nem
+                    # chegue aos callbacks do app; e engoli-la (return 1) esconde
+                    # a tecla também dos hooks abaixo do nosso e da janela em
+                    # foco. `Event.set()` custa o mesmo que o `queue.put()` que
+                    # este proc já faz — microssegundos contra 300 ms de
+                    # orçamento — e o `_last_fire` lá em cima já registrou que o
+                    # hook está vivo.
+                    if self._probe_pending:
+                        self._probe_seen.set()
+                    return 1
                 # Tecla com uma das nossas tags é tecla que NÓS injetamos (máscara ou
                 # transcrição): passa direto, senão o app se retriggera digitando.
-                if kb.dwExtraInfo not in IGNORED_TAGS:
+                if tag not in IGNORED_TAGS:
                     vk = kb.vkCode
                     down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
                     # AltGr do ABNT2 não é uma tecla: o Windows sintetiza LCtrl e, no
@@ -671,9 +734,90 @@ class HotkeyEngine:
             return False
         return True
 
+    def _probe_hook(self) -> bool | None:
+        """Prova POSITIVA de que o hook proc ainda recebe eventos.
+
+        Injeta um toque de `VK_MASK` marcado com `PROBE_TAG` e espera o hook proc
+        vê-lo. É a mesma tecla que já injetamos para desarmar o menu Iniciar: um
+        VK não atribuído, que o próprio hook proc engole antes de qualquer lógica
+        de chord — invisível para o usuário, para a janela em foco e para o app.
+
+        `True` = vivo, `False` = o hook foi mesmo despejado, `None` = não dá para
+        concluir nada (o UIPI engoliria a sonda, ou o `SendInput` recusou) e aí
+        reinstalar seria chute."""
+        if _uipi_drops_injection():
+            return None
+        # Limpar ANTES de armar `_probe_pending`: um `set()` atrasado da sonda
+        # anterior morre aqui em vez de responder por esta.
+        self._probe_seen.clear()
+        self._probe_pending = True
+        try:
+            ctypes.set_last_error(0)
+            if not u32.SendInput(2, _PROBE_INPUTS, _INPUT_SIZE):
+                # A sonda nem saiu (bloqueio de entrada, sessão trancada): sem
+                # tecla injetada não há o que o hook pudesse ter visto.
+                log.debug("liveness probe was not injected: %s",
+                          ctypes.WinError(ctypes.get_last_error()))
+                return None
+            return bool(self._probe_seen.wait(HOOK_PROBE_TIMEOUT_S))
+        except Exception:
+            log.exception("liveness probe failed to run")
+            return None
+        finally:
+            self._probe_pending = False
+
+    def _watchdog_tick(self, stopping: threading.Event) -> bool:
+        """Uma passada do watchdog. Devolve False quando ele deve morrer.
+
+        Separada do laço para ter como exercitar a decisão sem esperar timer
+        nenhum: é aqui que mora a diferença entre reinstalar o hook e apenas
+        achar que ele morreu."""
+        self._report_proc_errors()
+        self._sync_modifiers()
+        t = self._hook_thread
+        if t is None or not t.is_alive():
+            # GetMessageW devolveu -1, ou a thread morreu: sem ressuscitá-la o
+            # hotkey fica morto para sempre e ninguém fica sabendo.
+            log.error("hook thread is gone (installs=%d); restarting it", self.installs)
+            if not self._spawn_hook_thread(stopping):
+                return False
+            self._ready.wait(2.0)
+            return True
+        if not self._hook:
+            # Instalação falhando: não adianta esperar a heurística de silêncio,
+            # já sabemos que não há hook. Quem segura a frequência é o backoff.
+            self._post_reinstall("hook is not installed")
+            return True
+        silent = time.monotonic() - self._last_fire
+        if silent <= HOOK_SILENT_S or _idle_ms() >= INPUT_RECENT_MS:
+            return True
+        # Daqui para baixo é SUSPEITA, não diagnóstico. `GetLastInputInfo` conta
+        # teclado E mouse, e um `WH_KEYBOARD_LL` nunca dispara em evento de mouse:
+        # quem só mexeu o mouse por cinco segundos cai exatamente aqui com o hook
+        # intacto. Deduzir daí que o hook morreu enchia o log rotativo de 1 MB de
+        # reinstalações falsas, abria uma janela de tecla perdida a cada uma e
+        # apagava o único aviso que significa alguma coisa. Então perguntamos ao
+        # próprio hook em vez de deduzir.
+        verdict = self._probe_hook()
+        # Em qualquer veredicto o relógio zera: a sonda só pode voltar a rodar
+        # depois de outros HOOK_SILENT_S, nunca a cada tick do watchdog.
+        self._last_fire = time.monotonic()
+        if verdict is None:
+            log.debug("hook silent for %.1fs, but the liveness probe cannot run now "
+                      "(elevated window in focus or input refused): not reinstalling",
+                      silent)
+        elif verdict:
+            log.debug("hook silent for %.1fs (input the hook never sees, e.g. mouse); "
+                      "the liveness probe came back: the hook is alive", silent)
+        else:
+            log.warning("hook silent for %.1fs and the liveness probe never reached the "
+                        "hook proc -> reinstalling", silent)
+            self._post_reinstall("probe lost after %.1fs of silence" % silent)
+        return True
+
     def _watchdog(self, stopping: threading.Event) -> None:
-        """Se o SO viu input há pouco (`GetLastInputInfo`) mas nosso hook proc não
-        dispara há mais de 5 s, o Windows despejou o hook em silêncio: reinstalar.
+        """Vigia o hook: ressuscita a thread morta, reinstala o que não instalou e
+        confere com uma sonda se o hook emudecido ainda está vivo (`_probe_hook`).
 
         Recebe o próprio Event por parâmetro para que um watchdog de um ciclo
         anterior (stop() seguido de start()) morra em vez de virar um clone."""
@@ -681,29 +825,8 @@ class HotkeyEngine:
             try:
                 if stopping.is_set():
                     return
-                self._report_proc_errors()
-                self._sync_modifiers()
-                t = self._hook_thread
-                if t is None or not t.is_alive():
-                    # GetMessageW devolveu -1, ou a thread morreu: sem ressuscitá-la o
-                    # hotkey fica morto para sempre e ninguém fica sabendo.
-                    log.error("hook thread is gone (installs=%d); restarting it",
-                              self.installs)
-                    if not self._spawn_hook_thread(stopping):
-                        return
-                    self._ready.wait(2.0)
-                    continue
-                if not self._hook:
-                    # Instalação falhando: não adianta esperar a heurística de silêncio,
-                    # já sabemos que não há hook. Quem segura a frequência é o backoff.
-                    self._post_reinstall("hook is not installed")
-                    continue
-                silent = time.monotonic() - self._last_fire
-                if _idle_ms() < INPUT_RECENT_MS and silent > HOOK_SILENT_S:
-                    log.warning("hook silent for %.1fs while the OS saw input -> reinstalling",
-                                silent)
-                    self._last_fire = time.monotonic()   # evita repetir antes da reinstalação
-                    self._post_reinstall("silent for %.1fs" % silent)
+                if not self._watchdog_tick(stopping):
+                    return
             except Exception:
                 log.exception("hotkey watchdog iteration failed")
 

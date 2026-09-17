@@ -71,9 +71,11 @@ for _p in (_os.path.dirname(_HERE), _HERE):
 
 import _safety  # noqa: E402  stubs antes de qualquer import de wispr
 
+import ctypes
 import inspect
 import re
 import threading
+import time
 import types
 import unittest
 from datetime import datetime
@@ -1577,9 +1579,6 @@ class RepasteClearsTheFlagsTest(_AppCase):
         self.assertEqual(app.state, "transcribing")
         self.assertIn(_app.MSG_BUSY, app.overlay.messages)
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 # --------------------------------------------------------------------------- #
 # Etapa 1 do bring-up em hardware: a CUDA caiu para CPU porque o
@@ -1642,3 +1641,792 @@ class CudaDllPathTest(unittest.TestCase):
             self.assertEqual(_os.environ["PATH"], r"C:\so\esse")
         finally:
             _os.environ["PATH"] = old
+
+
+# --------------------------------------------------------------------------- #
+# Etapa 2 do bring-up em hardware: o watchdog reinstalava o hook de teclado toda
+# vez que o usuario mexia o MOUSE. Ver wispr/hotkey.py::_watchdog_tick.
+# --------------------------------------------------------------------------- #
+
+class _FakeU32:
+    """Camada Win32 de mentira para o watchdog do hook.
+
+    Nada aqui toca no teclado: `SendInput` so' anota o que TERIA sido injetado e,
+    quando o teste quer um hook vivo, entrega os eventos ao hook proc de verdade
+    -- que e' exatamente o que o Windows faria com a tecla injetada.
+    """
+
+    def __init__(self, engine, hook_sees=True, sent=2):
+        self.engine = engine
+        self.hook_sees = hook_sees
+        self.sent = sent
+        self.injected = []        # (vk, tag) de cada evento injetado
+        self.posts = []           # (tid, mensagem) de cada PostThreadMessageW
+        self.returns = []         # o que o hook proc devolveu para cada evento
+        self.chained = 0          # quantos eventos seguiram para o resto da cadeia
+
+    def SendInput(self, n, arr, size):
+        for i in range(n):
+            ki = arr[i].u.ki
+            self.injected.append((ki.wVk, ki.dwExtraInfo))
+        if self.hook_sees:
+            for i in range(n):
+                ki = arr[i].u.ki
+                up = bool(ki.dwFlags & _hotkey.KEYEVENTF_KEYUP)
+                self.returns.append(_feed_hookproc(
+                    self.engine, ki.wVk, ki.dwExtraInfo, down=not up))
+        return self.sent
+
+    def PostThreadMessageW(self, tid, msg, wparam, lparam):
+        self.posts.append((tid, msg))
+        return 1
+
+    def CallNextHookEx(self, hhk, ncode, wparam, lparam):
+        self.chained += 1
+        return 0
+
+    def GetAsyncKeyState(self, vk):
+        return 0
+
+
+def _feed_hookproc(eng, vk, tag, down=True):
+    """Chama o hook proc DE VERDADE com um KBDLLHOOKSTRUCT nosso.
+
+    O lParam de producao e' um ponteiro do SO; aqui e' o endereco de uma struct
+    ctypes viva no frame de quem chama, que e' o unico jeito de exercitar o proc
+    sem instalar hook nenhum.
+    """
+    kb = _hotkey.KBDLLHOOKSTRUCT(vkCode=vk, scanCode=0, flags=0, time=0,
+                                 dwExtraInfo=tag)
+    msg = _hotkey.WM_KEYDOWN if down else _hotkey.WM_KEYUP
+    return eng._hookproc(_hotkey.HC_ACTION, msg, ctypes.addressof(kb))
+
+
+@unittest.skipUnless(_hotkey, _why_hotkey or "wispr.hotkey indisponivel")
+class HookWatchdogProbeTest(unittest.TestCase):
+    """O watchdog so' reinstala o hook depois que uma SONDA nao voltou.
+
+    O bug: `GetLastInputInfo` devolve o ultimo input de teclado OU MOUSE, e um
+    WH_KEYBOARD_LL nunca dispara em evento de mouse. Cinco segundos de mouse sem
+    teclado -- ou seja, qualquer pessoa usando o computador -- faziam o watchdog
+    concluir que o Windows tinha despejado o hook. Na sessao real de 2 minutos
+    isso deu duas reinstalacoes com o Win+A funcionando no meio das duas.
+
+    O preco nao era so' log: cada unhook/reinstall e' uma janela em que uma tecla
+    se perde, o WARNING enchia o log rotativo de 1 MB que existe para diagnostico,
+    e destruia o sinal -- quando o hook e' despejado de verdade (ARCHITECTURE.md
+    secao 3) ninguem mais acreditaria na linha.
+    """
+
+    def setUp(self):
+        self.fired = []
+
+    def engine(self):
+        """Engine pronto para um tick do watchdog, sem hook nenhum instalado:
+        `HotkeyEngine.__init__` so' parseia o chord, quem instala e' o `start()`,
+        que nenhum teste chama."""
+        eng = _hotkey.HotkeyEngine(lambda: self.fired.append("start"),
+                                   lambda: self.fired.append("stop"),
+                                   lambda: self.fired.append("cancel"),
+                                   cfg=_config.Config(dict(_config.DEFAULTS)))
+        eng._hook = 0x1234                                  # ha' um hook nosso
+        eng._tid = 4242                                     # e uma thread para postar
+        eng._hook_thread = types.SimpleNamespace(is_alive=lambda: True)
+        eng._last_fire = time.monotonic() - 6.0             # mudo ha' 6 s
+        return eng
+
+    def tick(self, eng, u32, idle_ms=100, uipi=False, timeout=0.01):
+        """Uma passada do watchdog com a camada Win32 inteira de mentira.
+
+        `idle_ms=100` e' o cenario do bug: o SO viu input agorinha (o mouse) e o
+        hook esta' calado ha' 6 s."""
+        with mock.patch.object(_hotkey, "u32", u32), \
+                mock.patch.object(_hotkey, "_idle_ms", lambda: idle_ms), \
+                mock.patch.object(_hotkey, "_uipi_drops_injection", lambda: uipi), \
+                mock.patch.object(_hotkey, "HOOK_PROBE_TIMEOUT_S", timeout), \
+                mock.patch.object(_hotkey, "log", mock.MagicMock()) as log:
+            eng._watchdog_tick(threading.Event())
+        return log
+
+    # -------- o defeito em si -------- #
+
+    def test_moving_the_mouse_no_longer_reinstalls_the_hook(self):
+        eng = self.engine()
+        u32 = _FakeU32(eng)                      # o hook esta' vivo e ve a sonda
+        log = self.tick(eng, u32)
+        self.assertEqual(u32.posts, [],
+                         "hook vivo: nenhuma reinstalacao podia ter sido pedida")
+        self.assertFalse(log.warning.called,
+                         "o WARNING tem que ficar reservado para o hook morto")
+
+    def test_a_hook_that_really_died_is_still_reinstalled(self):
+        eng = self.engine()
+        u32 = _FakeU32(eng, hook_sees=False)     # despejado: a sonda nao volta
+        log = self.tick(eng, u32)
+        self.assertEqual(u32.posts, [(4242, _hotkey.WM_WISPR_REINSTALL)])
+        self.assertTrue(log.warning.called,
+                        "agora que o WARNING e' raro, ele tem que sair")
+
+    def test_the_verdict_comes_from_the_probe_and_not_from_the_idle_timer(self):
+        # Mesmo input recentissimo do SO nos dois casos: so' a sonda muda.
+        vivo, morto = self.engine(), self.engine()
+        u_vivo, u_morto = _FakeU32(vivo), _FakeU32(morto, hook_sees=False)
+        self.tick(vivo, u_vivo)
+        self.tick(morto, u_morto)
+        self.assertEqual((u_vivo.posts, len(u_morto.posts)), ([], 1))
+
+    # -------- a sonda em si -------- #
+
+    def test_the_probe_is_a_single_tap_of_the_mask_key(self):
+        eng = self.engine()
+        u32 = _FakeU32(eng)
+        self.tick(eng, u32)
+        self.assertEqual(u32.injected,
+                         [(_hotkey.VK_MASK, _hotkey.PROBE_TAG)] * 2,
+                         "um down e um up de VK 0xE8, com a tag da sonda")
+
+    def test_the_probe_uses_a_tag_of_its_own_that_the_hook_ignores(self):
+        self.assertIn(_hotkey.PROBE_TAG, _hotkey.IGNORED_TAGS)
+        self.assertNotIn(_hotkey.PROBE_TAG, (_hotkey.MASK_TAG, _hotkey.INJECT_TAG))
+        flags = [_hotkey._PROBE_INPUTS[i].u.ki.dwFlags for i in range(2)]
+        self.assertEqual(flags, [0, _hotkey.KEYEVENTF_KEYUP], "down e depois up")
+
+    def test_the_probe_timeout_is_short_enough_to_be_invisible(self):
+        # 150 ms contra 0,017 ms de custo medido do hook proc: folga de quatro
+        # ordens de grandeza sem prender o watchdog.
+        self.assertGreaterEqual(_hotkey.HOOK_PROBE_TIMEOUT_S, 0.05)
+        self.assertLessEqual(_hotkey.HOOK_PROBE_TIMEOUT_S, 0.5)
+
+    def test_the_probe_is_swallowed_before_any_chord_logic(self):
+        # O pior caso possivel: chord armado, gravando e cancelavel. Nem assim a
+        # sonda pode virar evento -- nem com o vk do proprio chord.
+        eng = self.engine()
+        eng.recording = True
+        eng.cancellable = True
+        for name in eng._down:
+            eng._down[name] = True
+        eng._probe_pending = True
+        u32 = _FakeU32(eng, hook_sees=False)
+        with mock.patch.object(_hotkey, "u32", u32):
+            rc = _feed_hookproc(eng, eng._vk, _hotkey.PROBE_TAG)
+        self.assertEqual(rc, 1, "a sonda e' engolida, nunca repassada")
+        self.assertEqual(u32.chained, 0, "nem os hooks abaixo do nosso a veem")
+        self.assertTrue(eng.q.empty(), "a sonda nao pode virar start/stop/cancel")
+        self.assertFalse(eng._chord)
+        self.assertEqual(self.fired, [])
+
+    def test_the_same_key_without_the_tag_still_starts_a_dictation(self):
+        # Contraprova do teste acima: o que engole a sonda e' a TAG, nao um hook
+        # proc que parou de reconhecer o chord.
+        eng = self.engine()
+        for name in eng._down:
+            eng._down[name] = True
+        u32 = _FakeU32(eng, hook_sees=False)
+        with mock.patch.object(_hotkey, "u32", u32):
+            rc = _feed_hookproc(eng, eng._vk, 0)
+        self.assertEqual(rc, 1)
+        self.assertEqual(eng.q.get_nowait(), "start")
+
+    def test_a_late_probe_cannot_answer_for_the_next_one(self):
+        # Sem sonda no ar, um evento atrasado do ciclo anterior nao pode marcar
+        # vida -- senao um hook morto passaria por vivo uma vez a cada ciclo.
+        eng = self.engine()
+        u32 = _FakeU32(eng, hook_sees=False)
+        with mock.patch.object(_hotkey, "u32", u32):
+            _feed_hookproc(eng, _hotkey.VK_MASK, _hotkey.PROBE_TAG)
+        self.assertFalse(eng._probe_seen.is_set())
+
+    # -------- quando a sonda NAO deve rodar -------- #
+
+    def test_the_probe_does_not_run_while_the_hook_is_firing(self):
+        eng = self.engine()
+        eng._last_fire = time.monotonic()        # disparou agorinha
+        u32 = _FakeU32(eng)
+        self.tick(eng, u32)
+        self.assertEqual((u32.injected, u32.posts), ([], []))
+
+    def test_the_probe_does_not_run_when_the_os_saw_no_input(self):
+        eng = self.engine()
+        u32 = _FakeU32(eng)
+        self.tick(eng, u32, idle_ms=30000)       # ninguem encostou na maquina
+        self.assertEqual(u32.injected, [])
+
+    def test_the_probe_does_not_run_on_every_watchdog_tick(self):
+        eng = self.engine()
+        u32 = _FakeU32(eng)
+        self.tick(eng, u32)
+        self.assertEqual(len(u32.injected), 2)
+        self.tick(eng, u32)                      # tick seguinte, ainda so' mouse
+        self.assertEqual(len(u32.injected), 2,
+                         "a sonda so' roda quando a suspeita NASCE, nao a cada tick")
+
+    def test_a_failed_probe_is_not_retried_on_the_very_next_tick(self):
+        eng = self.engine()
+        u32 = _FakeU32(eng, hook_sees=False)
+        self.tick(eng, u32)
+        self.tick(eng, u32)
+        self.assertEqual(len(u32.posts), 1,
+                         "uma reinstalacao por serie de silencio, nao uma por tick")
+
+    def test_a_hook_that_is_not_installed_is_reinstalled_without_probing(self):
+        eng = self.engine()
+        eng._hook = None
+        u32 = _FakeU32(eng, hook_sees=False)
+        self.tick(eng, u32)
+        self.assertEqual(u32.injected, [], "sem hook instalado nao ha' o que sondar")
+        self.assertEqual(u32.posts, [(4242, _hotkey.WM_WISPR_REINSTALL)])
+
+    # -------- UIPI: a sonda perdida que nao prova nada -------- #
+
+    def test_an_elevated_window_in_focus_skips_the_whole_check(self):
+        # Sob UIPI a injecao some com GetLastError() == 0 (ARCHITECTURE.md secao
+        # 5) e o hook nao recebe evento nenhum (secao 3): a sonda perdida nao
+        # prova que o hook morreu, e reinstalar nao devolveria os eventos.
+        eng = self.engine()
+        u32 = _FakeU32(eng, hook_sees=False)
+        log = self.tick(eng, u32, uipi=True)
+        self.assertEqual(u32.injected, [], "nem injetar faz sentido: o UIPI engole")
+        self.assertEqual(u32.posts, [], "reinstalar nao devolve os eventos")
+        self.assertFalse(log.warning.called)
+
+    def test_a_hook_that_died_under_an_elevated_window_is_reinstalled_later(self):
+        # O outro lado do teste acima, e o que impede a correcao de virar um
+        # buraco novo: "nao sei" nao pode virar esquecimento. O hook despejado
+        # continua despejado quando a janela elevada perde o foco, e ai a sonda
+        # roda e o reinstala. O atraso e' de um HOOK_SILENT_S, nao eterno.
+        eng = self.engine()
+        u32 = _FakeU32(eng, hook_sees=False)        # despejado de verdade
+        self.tick(eng, u32, uipi=True)
+        self.assertEqual(u32.posts, [], "sob UIPI nao da' para concluir nada")
+        eng._last_fire = time.monotonic() - 6.0     # o silencio continua
+        self.tick(eng, u32, uipi=False)             # foco voltou ao normal
+        self.assertEqual(u32.posts, [(4242, _hotkey.WM_WISPR_REINSTALL)])
+
+    def test_a_verdict_that_lands_after_stop_posts_nothing(self):
+        # Desligamento no meio da sonda: `stop()` zera o tid sob o mesmo lock que
+        # `_post_reinstall` le. Sem essa checagem o veredito atrasado postaria
+        # WM_WISPR_REINSTALL para a thread do hook que acabou de morrer.
+        eng = self.engine()
+        eng._tid = 0                                 # stop() ja passou por aqui
+        u32 = _FakeU32(eng, hook_sees=False)
+        self.tick(eng, u32)
+        self.assertEqual(u32.posts, [], "nao ha thread de hook para receber")
+
+    def test_an_injection_that_never_left_proves_nothing(self):
+        eng = self.engine()
+        u32 = _FakeU32(eng, hook_sees=False, sent=0)   # SendInput recusou
+        log = self.tick(eng, u32)
+        self.assertEqual(u32.posts, [])
+        self.assertFalse(log.warning.called)
+
+    def test_only_a_confirmed_uipi_block_holds_the_probe(self):
+        if _inject is None:
+            self.skipTest(_why_inject or "wispr.inject indisponivel")
+        # `None` e' "nao deu para saber", nunca "bloqueado": tratar o desconhecido
+        # como bloqueio devolveria o bug ao contrario, com um hook realmente
+        # despejado nunca mais sendo reinstalado.
+        for answer, expected in ((True, True), (False, False), (None, False)):
+            with mock.patch.object(_hotkey, "is_elevated", lambda: False), \
+                    mock.patch.object(_inject, "injection_blocked", lambda: answer):
+                self.assertIs(_hotkey._uipi_drops_injection(), expected,
+                              "injection_blocked() == %r" % (answer,))
+
+    def test_an_elevated_wisper_is_never_blocked_by_uipi(self):
+        if _inject is None:
+            self.skipTest(_why_inject or "wispr.inject indisponivel")
+        # Rodar elevado e' a solucao RECOMENDADA da secao 6: ali nada esta acima
+        # de nos e nem vale perguntar pela janela em foco.
+        calls = []
+        with mock.patch.object(_hotkey, "is_elevated", lambda: True), \
+                mock.patch.object(_inject, "injection_blocked",
+                                  lambda: calls.append(1) or True):
+            self.assertFalse(_hotkey._uipi_drops_injection())
+        self.assertEqual(calls, [])
+
+    # -------- o que o CONTRACT.md promete nao pode mudar -------- #
+
+    def test_the_probe_touches_no_counter_of_the_contract(self):
+        eng = self.engine()
+        u32 = _FakeU32(eng)
+        self.tick(eng, u32)
+        self.assertEqual((eng.installs, eng.failed_installs), (0, 0),
+                         "sondar nao e' instalar: os contadores sao de instalacao")
+        self.assertTrue(eng.alive, "`alive` e' 'existe um hook nosso', e existe")
+
+    def test_the_install_backoff_is_untouched(self):
+        eng = self.engine()
+        base = eng._watchdog_period()
+        u32 = _FakeU32(eng, hook_sees=False)
+        self.tick(eng, u32)
+        self.assertEqual(eng._consec_fails, 0, "a sonda nao conta falha de instalacao")
+        self.assertEqual(eng._watchdog_period(), base)
+        eng._consec_fails = 3                    # agora sim, INSTALL falhando
+        self.assertGreater(eng._watchdog_period(), base)
+
+
+# --------------------------------------------------------------------------- #
+# Etapa 2 do bring-up em hardware. Dois defeitos que so aparecem com o app
+# rodando de verdade, e nenhum dos dois quebra nada -- eles entregam lixo.
+#
+# 13. Corrida de pontuacao no ditado CURTO. O primeiro ditado real entregou
+#     `Oi,` seguido de 51 pontos (55 chars) e `Faca deploy ` seguido de 10
+#     pontos (23 chars), com acento certo e contabilidade de entrega certa: o
+#     lixo veio do modelo. A causa medida e' a escada de temperatura do
+#     faster-whisper. Num ditado real cabem poucas palavras dentro da janela de
+#     30 s, o avg_logprob do decode greedy cai abaixo do log_prob_threshold
+#     (-1,0) e o faster-whisper marca needs_fallback e SORTEIA ate' temperatura
+#     1,0 -- depois escolhe por avg_logprob entre amostras de temperaturas
+#     diferentes, que nao sao comparaveis entre si. Os outros dois guarda-chuvas
+#     nao pegam nada: gzip("Faca deploy ..........") da razao 1,0 contra um
+#     limiar de 2,4 (a corrida e' curta demais para o gzip enxergar) e o
+#     no_speech_prob volta 0,0, porque ha fala de verdade no clipe.
+# 14. `GET huggingface.co/api/models/<id>/revision/main` em TODO boot, com o
+#     modelo inteiro ja em models/. Um round trip de rede por inicializacao num
+#     app que tem que subir sem conexao.
+# --------------------------------------------------------------------------- #
+
+_stt, _why_stt = _safety.load_pure("wispr.stt")
+
+
+@unittest.skipUnless(_stt, _why_stt or "wispr.stt indisponivel")
+class PunctuationRunGuardTest(unittest.TestCase):
+    """O cinto de seguranca contra a corrida de pontuacao.
+
+    O suspensorio e' o decode greedy (TemperatureLadderTest); isto aqui existe
+    porque o modelo sempre vai poder surpreender. A regra tem que ser
+    conservadora ate' o exagero: ela roda em TODA transcricao, e apagar um
+    caractere de texto legitimo e' pior que deixar passar uma corrida de pontos.
+    """
+
+    #: As duas saidas REAIS do primeiro ditado em hardware (logs/wisper.log).
+    REAL = [
+        ("Oi," + "." * 51, "Oi,"),
+        ("Faca deploy " + "." * 10, "Faca deploy"),
+        ("Fa\u00e7a deploy " + "." * 10, "Fa\u00e7a deploy"),
+    ]
+
+    #: Texto que um usuario dita ou cola de verdade. NADA aqui pode mudar -- nem
+    #: um caractere, nem um espaco.
+    LEGIT = [
+        "Espera ai...",                        # reticencia ditada
+        "Espera a\u00ed...",
+        "Bom... acho que sim.",                # reticencia no meio da frase
+        "Ele disse: ... e foi embora.",        # reticencia solta NO MEIO
+        "https://exemplo.com.br/a/b",          # URL
+        "Veja em https://ex.com/docs/...",     # URL que termina em reticencia
+        "O valor e 3.14 e o outro 1,5.",       # decimal com ponto e com virgula
+        "R$ 1.000.000,00",                     # milhar pt-BR
+        "arquivo.tar.gz",
+        "versao 1.2.3",
+        "cd ..",                               # dois pontos soltos: nao e corrida
+        "cd .. && ls",
+        "Que?!",                               # pontuacao empilhada LEGITIMA
+        "Serio mesmo?!",
+        "import os; import sys;",
+        "Sobe o container com docker compose up.",
+        "Alo, teste, teste, alo, alo, teste.",  # o controle limpo de 8 s
+        "Um, dois, tres.",
+    ]
+
+    def guard(self, text):
+        return _stt.strip_punct_runs(text)
+
+    def only_word_chars(self, text):
+        return "".join(ch for ch in text if ch.isalnum())
+
+    def test_the_two_real_dictations_come_out_clean(self):
+        for dirty, clean in self.REAL:
+            with self.subTest(dirty=dirty[:24]):
+                self.assertEqual(self.guard(dirty), clean)
+
+    def test_legitimate_text_comes_back_character_for_character(self):
+        for text in self.LEGIT:
+            with self.subTest(text=text):
+                self.assertEqual(self.guard(text), text)
+
+    def test_the_guard_never_drops_a_letter_or_a_digit(self):
+        # A garantia mais forte que da para escrever: a regra so mexe em
+        # pontuacao. Vale ate' para as saidas sujas -- "Oi," continua "Oi".
+        for text in self.LEGIT + [d for d, _c in self.REAL]:
+            with self.subTest(text=text[:24]):
+                self.assertEqual(self.only_word_chars(self.guard(text)),
+                                 self.only_word_chars(text))
+
+    def test_a_dictated_ellipsis_survives_a_run_of_thirty_dots(self):
+        # Colapsa para TRES, nao para um: "..." e a unica sequencia de pontuacao
+        # repetida que existe na ortografia do pt-BR.
+        self.assertEqual(self.guard("Bom" + "." * 30 + " e depois fui."),
+                         "Bom... e depois fui.")
+
+    def test_a_run_of_any_other_punctuation_collapses_to_one(self):
+        for dirty, clean in ((",,,,", ","), ("!!!!!", "!"), ("?????", "?"),
+                             (";;;", ";"), (":::", ":")):
+            with self.subTest(dirty=dirty):
+                self.assertEqual(self.guard("texto" + dirty + " mais texto"),
+                                 "texto" + clean + " mais texto")
+
+    def test_two_repeats_are_below_the_threshold(self):
+        # A regra e' "3 ou mais IGUAIS". Duas ficam como vieram, porque duas
+        # aparecem em texto de verdade ("cd ..", "Que?!" ja coberto acima).
+        self.assertEqual(self.guard("ok,, vamos"), "ok,, vamos")
+
+    def test_a_detached_tail_needs_three_dots_to_be_stripped(self):
+        self.assertEqual(self.guard("cd .."), "cd ..")
+        self.assertEqual(self.guard("faz o deploy ..."), "faz o deploy")
+
+    def test_a_tail_stacked_on_other_punctuation_goes_away(self):
+        self.assertEqual(self.guard("Oi,..."), "Oi,")
+        self.assertEqual(self.guard("Sera?..."), "Sera?")
+
+    def test_the_segments_joined_by_a_space_also_collapse(self):
+        # `_transcribe_local` junta os segmentos com " ", entao a corrida chega
+        # como pontos separados por espaco e nao como um run continuo.
+        self.assertEqual(self.guard(". . . . . . . . ."), ".")
+
+    def test_the_guard_is_idempotent(self):
+        for text in self.LEGIT + [d for d, _c in self.REAL]:
+            with self.subTest(text=text[:24]):
+                once = self.guard(text)
+                self.assertEqual(self.guard(once), once)
+
+    def test_postprocess_applies_the_guard_on_the_contract_call(self):
+        # A chamada de DUAS posicoes do CONTRACT.md e' a que o app usa por
+        # padrao: se o cinto so valesse com o keyword de alucinacao, ele nao
+        # estaria no caminho do ditado.
+        self.assertEqual(_stt.postprocess("Oi," + "." * 51, ()), "Oi,")
+        self.assertEqual(_stt.postprocess("Faca deploy " + "." * 10, ()), "Faca deploy")
+
+    def test_postprocess_still_leaves_normal_text_alone(self):
+        cfg = _config.load()
+        clean = "Alo, teste, teste, alo, alo, teste."
+        self.assertEqual(_stt.postprocess(clean, cfg.get("fixups")), clean)
+
+    def test_the_guard_runs_after_the_fixups_and_after_the_space_collapse(self):
+        # Ordem: fixups -> colapso de espaco -> guard. A regra de cauda solta
+        # enxerga " ..." com UM espaco, entao rodar antes do colapso deixaria
+        # passar o que vem do modelo com quebra de linha no meio.
+        self.assertEqual(_stt.postprocess("Faca deploy\n\n" + "." * 10, ()),
+                         "Faca deploy")
+        self.assertEqual(_stt.postprocess("roda docker campus up .....",
+                                          [["docker campus up", "docker compose up"]]),
+                         "roda docker compose up")
+
+
+@unittest.skipUnless(_stt, _why_stt or "wispr.stt indisponivel")
+class TemperatureLadderTest(unittest.TestCase):
+    """A correcao de verdade: decode greedy, sem sorteio.
+
+    Medido nesta maquina com o modelo carregado. Nos dois clipes sinteticos de
+    4,9 s que reproduzem o defeito, 12 tentativas cada: a escada deu 4/12 e 6/12
+    corridas de pontos e 4 e 7 textos DIFERENTES para o mesmo wav; o greedy deu
+    0/12 e 0/12 e um unico texto. Numa varredura de 972 clipes de 2 a 6 s a
+    escada produziu 9 loops de palavra contra 1 do greedy. WER nas tres fixtures:
+    identico, texto por texto (0,0 / 10,7 / 0,0; media 3,6%), porque as tres ja
+    decodificavam em temperatura 0,0 e nunca chegavam a usar a escada.
+    """
+
+    def kwargs(self, **over):
+        cfg = _config.load()
+        cfg.update(over)
+        return _stt._decode_kwargs(cfg)
+
+    def test_the_default_is_greedy_only(self):
+        self.assertEqual(list(self.kwargs()["temperature"]), [0.0])
+
+    def test_the_default_config_ships_with_the_ladder_off(self):
+        self.assertIn("temperature_fallback", _config.DEFAULTS)
+        self.assertFalse(_config.DEFAULTS["temperature_fallback"])
+
+    def test_the_escape_hatch_brings_the_whole_ladder_back(self):
+        # Desligar por padrao nao pode virar remover: se o proximo modelo
+        # precisar da escada, ela tem que voltar por config, sem editar codigo.
+        got = list(self.kwargs(temperature_fallback=True)["temperature"])
+        self.assertEqual(got, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+        self.assertEqual(got, list(_stt.TEMPERATURE_LADDER))
+
+    def test_the_temperature_is_always_a_sequence(self):
+        # Um float solto tambem e' aceito pelo faster-whisper, mas ai o
+        # `for temperature in temperatures` itera... nada, e o fallback silencia.
+        for over in ({}, {"temperature_fallback": True}):
+            with self.subTest(over=over):
+                self.assertIsInstance(self.kwargs(**over)["temperature"], list)
+
+    def test_the_ladder_constant_is_still_the_whisper_default(self):
+        # Ancora: sem ela alguem pode "consertar" a corrida de pontos encurtando
+        # a constante e o teste acima continuaria verde sem querer dizer nada.
+        self.assertEqual(list(_stt.TEMPERATURE_LADDER), [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+
+    def test_the_other_measured_parameters_are_untouched(self):
+        # Os tres achados do sweep de ARCHITECTURE.md secao 2 continuam de pe.
+        kw = self.kwargs()
+        self.assertEqual(kw["beam_size"], 1)
+        self.assertFalse(kw["condition_on_previous_text"])
+        self.assertNotIn("hotwords", kw)
+
+
+@unittest.skipUnless(_stt, _why_stt or "wispr.stt indisponivel")
+class OfflineModelLoadTest(unittest.TestCase):
+    """O boot nao pode depender de rede com o modelo inteiro em models/."""
+
+    def fake_utils(self, fn):
+        """Instala um `faster_whisper.utils` de mentira so durante o teste.
+
+        Na suite o `faster_whisper` e' stub e nem pacote e': sem este remendo o
+        `from faster_whisper.utils import download_model` levanta
+        ModuleNotFoundError -- que e' exatamente o caminho "sem cache".
+        """
+        mod = types.ModuleType("faster_whisper.utils")
+        mod.download_model = fn
+        return mock.patch.dict(_sys.modules, {"faster_whisper.utils": mod})
+
+    def files_present(self, folder, names):
+        """Finge um snapshot com esses arquivos, sem escrever nada em disco."""
+        want = {_os.path.join(folder, n) for n in names}
+        return mock.patch.object(_stt.os.path, "isfile", lambda p: p in want)
+
+    def test_a_cached_model_is_resolved_with_local_files_only(self):
+        seen = []
+        snap = r"D:\wisper\models\hub\snapshots\abc"
+
+        def download(model_id, **kw):
+            seen.append((model_id, kw))
+            return snap
+
+        with self.fake_utils(download), self.files_present(snap, _stt.SNAPSHOT_FILES):
+            source, offline = _stt.resolve_model_source("deepdml/whatever-ct2")
+        self.assertEqual(source, snap)
+        self.assertTrue(offline)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0][1].get("local_files_only"),
+                        "sem local_files_only o faster-whisper bate no Hub a cada boot")
+
+    def test_a_half_downloaded_snapshot_falls_back_to_the_online_id(self):
+        # Um download interrompido e' o UNICO jeito de o caminho offline piorar
+        # as coisas: o online repararia sozinho, o offline entregaria um
+        # diretorio sem model.bin e o Engine cairia para CPU achando que a
+        # culpa foi da VRAM.
+        snap = r"D:\wisper\models\hub\snapshots\abc"
+        with self.fake_utils(lambda model_id, **kw: snap), \
+                self.files_present(snap, ["config.json"]):
+            self.assertEqual(_stt.resolve_model_source("deepdml/pela-metade"),
+                             ("deepdml/pela-metade", False))
+
+    def test_a_model_that_is_not_cached_keeps_the_online_id(self):
+        def missing(model_id, **kw):
+            raise OSError("LocalEntryNotFoundError")
+
+        with self.fake_utils(missing):
+            source, offline = _stt.resolve_model_source("deepdml/ainda-nao-baixado")
+        self.assertEqual(source, "deepdml/ainda-nao-baixado")
+        self.assertFalse(offline)
+
+    def test_resolving_never_raises(self):
+        # Sob pythonw.exe nao existe console: uma excecao aqui derrubaria o boot
+        # sem deixar rastro nenhum na tela.
+        for boom in (MemoryError, ValueError, RuntimeError, ImportError):
+            with self.subTest(boom=boom.__name__):
+                def blow(model_id, _exc=boom, **kw):
+                    raise _exc("sintetico")
+
+                with self.fake_utils(blow):
+                    self.assertEqual(_stt.resolve_model_source("x/y"), ("x/y", False))
+
+    def test_an_explicit_directory_never_touches_the_hub(self):
+        def never(model_id, **kw):
+            self.fail("um diretorio local nao pode consultar o Hub")
+
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        with self.fake_utils(never):
+            self.assertEqual(_stt.resolve_model_source(here), (here, True))
+
+    def test_an_empty_model_id_is_not_a_crash(self):
+        self.assertEqual(_stt.resolve_model_source(""), ("", False))
+
+    def test_a_snapshot_without_the_tokenizer_is_not_used_offline(self):
+        # tokenizer.json ausente NAO e' erro no faster-whisper: o WhisperModel
+        # cai em `Tokenizer.from_pretrained("openai/whisper-tiny")`
+        # (transcribe.py:700-707), que baixa da rede -- o round trip que esta
+        # correcao existe para eliminar -- e ainda com o vocabulario errado, que
+        # o large-v3 tem um token de idioma a mais que o tiny. Com o id, o
+        # download_model repara o snapshot.
+        snap = r"D:\wisper\models\hub\snapshots\abc"
+        with self.fake_utils(lambda model_id, **kw: snap), \
+                self.files_present(snap, ["model.bin", "config.json"]):
+            self.assertEqual(_stt.resolve_model_source("deepdml/sem-tokenizer"),
+                             ("deepdml/sem-tokenizer", False))
+
+    def test_a_missing_preprocessor_config_is_not_treated_as_incomplete(self):
+        # O Systran/faster-whisper-small em cache nesta maquina nao tem
+        # preprocessor_config.json e esta' correto: 80 mel bins e' o default do
+        # FeatureExtractor. Exigi-lo mandaria esse modelo para a rede todo boot.
+        snap = r"D:\wisper\models\hub\snapshots\small"
+        with self.fake_utils(lambda model_id, **kw: snap), \
+                self.files_present(snap, ["model.bin", "config.json", "tokenizer.json"]):
+            self.assertEqual(_stt.resolve_model_source("Systran/faster-whisper-small"),
+                             (snap, True))
+        self.assertNotIn("preprocessor_config.json", _stt.SNAPSHOT_FILES)
+
+    # ------- a resolucao so serve se o WhisperModel receber o resultado ------ #
+
+    def _fake_classes(self, seen):
+        class FakeWhisperModel:
+            def __init__(self, source, device=None, compute_type=None):
+                seen.append(source)
+
+            def transcribe(self, audio, **kw):
+                return (), None
+
+        class FakePipeline:
+            def __init__(self, model=None):
+                self.model = model
+
+        return FakeWhisperModel, FakePipeline
+
+    def _engine(self, source):
+        eng = object.__new__(_stt.Engine)
+        eng.model_id = "deepdml/faster-whisper-large-v3-turbo-ct2"
+        eng.model_source = source
+        eng._decode = dict(_stt._decode_kwargs(_config.load()))
+        return eng
+
+    def test_the_model_is_loaded_from_the_resolved_snapshot(self):
+        seen = []
+        eng = self._engine(r"D:\wisper\models\hub\snapshots\abc")
+        eng._load(*self._fake_classes(seen), "cuda", "int8_float16")
+        self.assertEqual(seen, [r"D:\wisper\models\hub\snapshots\abc"],
+                         "o _load ignorou o snapshot e mandou o id para o Hub")
+
+    def test_without_a_snapshot_the_load_falls_back_to_the_id(self):
+        seen = []
+        eng = self._engine("")
+        eng._load(*self._fake_classes(seen), "cpu", "int8")
+        self.assertEqual(seen, ["deepdml/faster-whisper-large-v3-turbo-ct2"])
+
+    def test_the_two_new_attributes_are_born_in_init(self):
+        # O caminho groq volta de `__init__` antes de carregar modelo nenhum: se
+        # os atributos so nascessem no caminho local, quem le diagnostico do
+        # Engine em modo groq levaria AttributeError.
+        src = inspect.getsource(_stt.Engine.__init__)
+        for name in ("self.model_source", "self.offline"):
+            self.assertIn(name, src)
+        self.assertLess(src.index("self.offline"), src.index('"groq"'),
+                        "tem que nascer ANTES do retorno antecipado do groq")
+
+
+# --------------------------------------------------------------------------- #
+# Verificacao independente das duas correcoes de bring-up. Dois defeitos que
+# nenhuma das duas rodadas pegou, e nenhum deles aparece como erro:
+#
+# 15. O cinto contra a corrida de pontuacao era O(n^2). O padrao
+#     `(?:\s+[.…]+)+\s*$` tem quantificador aninhado, e quando o modelo entra em
+#     loop de ". . . ." e a fala NAO termina no loop nao existe casamento
+#     nenhum: o `search` varre o texto inteiro a partir de cada posicao. Medido
+#     nesta maquina: 20 ms para 2 kB, 305 ms para 8 kB, 1,22 s para 16 kB -- e
+#     `max_record_sec` e' 175 s, ou seja, o texto cabe. O pior caso do guarda
+#     era exatamente o lixo que ele existe para limpar, e o custo caia em cima
+#     da thread worker, com o usuario esperando o texto.
+# 16. O `if __name__ == "__main__"` deste arquivo estava no MEIO dele. Rodar
+#     `python tests/test_regressions.py` executava 98 de 146 testes e imprimia
+#     OK: as cinco classes definidas depois daquela linha -- todas as dos dois
+#     bring-ups -- nunca chegavam a existir. O `unittest discover` continuava
+#     correto, o que e' justamente o que tornava isso invisivel.
+# --------------------------------------------------------------------------- #
+
+#: O padrao que `_stt._detached_tail_start()` substituiu. A varredura linear so'
+#: vale se devolver exatamente o mesmo corte que ele devolvia.
+_OLD_DETACHED_RE = re.compile(r"(?:\s+[.…]+)+\s*$")
+
+
+@unittest.skipUnless(_stt, _why_stt or "wispr.stt indisponivel")
+class PunctuationGuardCostTest(unittest.TestCase):
+    """O guarda roda em TODA transcricao, na thread worker, com o usuario
+    esperando o texto aparecer na janela. Custo tambem e' comportamento."""
+
+    #: Casos escolhidos para separar as duas regras (colada x solta), com todas
+    #: as formas de espaco que o `\s` do padrao original aceitava.
+    EQUIV = [
+        "", " ", "...", " ...", "cd ..", "cd ...", "cd .. ...", "Espera ai...",
+        "Espera ai... ...", "Faca deploy ..........", "Oi,...", ". . . . .",
+        "texto …", "texto ………", "texto \t\n ...  ",
+        "texto ...", "texto ... e mais texto", "Bom... acho que sim.",
+        "https://ex.com/docs/...", "um . dois . tres .",
+    ]
+
+    def old_cut(self, text):
+        m = _OLD_DETACHED_RE.search(text)
+        if m and sum(m.group(0).count(ch) for ch in ".…") >= _stt.MIN_DETACHED_DOTS:
+            return text[:m.start()]
+        return text
+
+    def new_cut(self, text):
+        start = _stt._detached_tail_start(text)
+        return text[:start] if start >= 0 else text
+
+    def test_the_linear_scan_cuts_exactly_where_the_pattern_cut(self):
+        # Ancora de equivalencia: a troca foi por CUSTO, e nao pode ter mexido
+        # em uma virgula do que o guarda aceita ou recusa.
+        for text in self.EQUIV:
+            with self.subTest(text=text):
+                self.assertEqual(self.new_cut(text), self.old_cut(text))
+
+    def test_a_dot_loop_that_does_not_end_the_text_is_not_quadratic(self):
+        # A forma do pior caso: loop de ". . . ." com fala depois dele, entao
+        # nao ha cauda para casar e o padrao antigo varria tudo de cada posicao.
+        # 16 kB medidos: 1,22 s com o padrao, 0,006 ms com a varredura. O teto
+        # de 0,25 s tem folga de tres ordens de grandeza para a versao correta e
+        # ainda assim e' cinco vezes menor que o que a errada gastava.
+        dirty = "Oi " + ". " * 8000 + "e depois fui embora."
+        t0 = time.perf_counter()
+        out = _stt.strip_punct_runs(dirty)
+        took = time.perf_counter() - t0
+        self.assertLess(took, 0.25,
+                        "strip_punct_runs levou %.0f ms em %d chars" % (took * 1000,
+                                                                        len(dirty)))
+        self.assertTrue(out.endswith("e depois fui embora."))
+
+    def test_the_cost_does_not_explode_with_the_text_size(self):
+        # Quadratico dobra o texto e quadruplica o tempo; linear dobra. O teto
+        # generoso existe porque isto e' medida de tempo numa maquina com o
+        # desktop em uso, nao um benchmark.
+        def cost(n):
+            dirty = "Oi " + ". " * n + "fim."
+            t0 = time.perf_counter()
+            _stt.strip_punct_runs(dirty)
+            return time.perf_counter() - t0
+
+        cost(500)                       # aquece o regex cache
+        small = min(cost(1000) for _ in range(3))
+        big = min(cost(4000) for _ in range(3))
+        # 4x o texto: linear da' ~4x, quadratico daria ~16x.
+        self.assertLess(big, max(small * 8.0, 0.02),
+                        "custo cresceu %.1fx para 4x de texto" % (big / small if small else 0))
+
+
+class SuiteIsReachableTest(unittest.TestCase):
+    """Rodar este arquivo direto tem que rodar TODOS os testes dele.
+
+    Com o `unittest.main()` no meio do modulo, `python tests/test_regressions.py`
+    parava ali: as classes escritas depois nem chegavam a ser definidas, o
+    processo saia com OK e 48 testes -- os dois bring-ups inteiros -- ficavam de
+    fora. Como o `discover` do CI continuava vendo tudo, ninguem notava. Dois
+    agentes anexaram codigo depois daquela linha sem perceber.
+    """
+
+    def test_the_main_guard_is_the_last_thing_in_this_file(self):
+        import ast
+
+        src = _os.path.join(_HERE, "test_regressions.py")
+        with open(src, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        guards = [n.lineno for n in tree.body
+                  if isinstance(n, ast.If) and "__main__" in ast.dump(n.test)]
+        self.assertEqual(len(guards), 1, "um unico `if __name__ == '__main__'`")
+        last_def = max(n.lineno for n in tree.body
+                       if isinstance(n, (ast.ClassDef, ast.FunctionDef)))
+        self.assertGreater(guards[0], last_def,
+                           "ha codigo de teste definido DEPOIS do unittest.main(): "
+                           "rodar este arquivo direto nao executaria esses testes")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

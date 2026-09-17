@@ -43,7 +43,12 @@ SR = 16000                    # taxa que o faster-whisper exige na entrada
 WARMUP_SEC = 2.0
 BATCH_MIN_SEC = 30.0          # abaixo disso o batched nao compensa a VRAM extra
 BATCH_SIZE = 8
+# A escada de temperatura do Whisper, DESLIGADA por padrao nesta aplicacao.
+# Ver _decode_kwargs() e docs/ARCHITECTURE.md secao 2: ela e' a causa medida das
+# corridas de pontuacao em ditado curto. `temperature_fallback: true` no
+# config.json devolve o comportamento original do faster-whisper.
 TEMPERATURE_LADDER = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+GREEDY_ONLY = [0.0]
 
 # Teto de espera do close() pela transcricao em voo. A bandeja chama close() na
 # thread principal: travar ali e o app que nao fecha.
@@ -53,6 +58,22 @@ CLOSE_TIMEOUT_SEC = 5.0
 PROMPT_MAX_CHARS = 900
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+# O minimo que um snapshot CTranslate2 precisa ter para valer a pena carregar
+# offline. Ver resolve_model_source().
+#
+# `tokenizer.json` esta aqui porque a falta dele nao e' um erro no
+# faster-whisper: o WhisperModel cai em
+# `tokenizers.Tokenizer.from_pretrained("openai/whisper-tiny")`
+# (transcribe.py:700-707), que BAIXA da rede -- exatamente o round trip que
+# resolve_model_source() existe para eliminar -- e ainda entrega o vocabulario
+# errado, porque o large-v3 tem um token de idioma a mais que o tiny. Sem
+# tokenizer.json o caminho online e' melhor: o download_model repara o snapshot.
+# `preprocessor_config.json` NAO entra: o Systran/faster-whisper-small em cache
+# nesta maquina nao tem esse arquivo e esta' correto, porque 80 mel bins e' o
+# default do FeatureExtractor. Exigi-lo mandaria esse modelo para a rede todo
+# boot.
+SNAPSHOT_FILES = ("model.bin", "config.json", "tokenizer.json")
 
 # Alucinacao classica do Whisper em audio vazio/quase vazio. So e aplicada a um
 # unico segmento curto — fala real nunca e censurada.
@@ -67,6 +88,76 @@ _HALLUCINATIONS = frozenset({
 })
 
 _WS = re.compile(r"\s+")
+
+# ---------------------------------------------------------- corridas de pontuacao
+# O large-v3-turbo tem um decoder destilado de 4 camadas e entra em loop de "."
+# quando a janela de 30 s tem pouca fala -- exatamente o formato de um ditado
+# real (Win+A, pausa, duas palavras, pausa, Enter). A rede de seguranca real e'
+# o decode greedy (ver _decode_kwargs); isto aqui e' o cinto, porque o modelo
+# sempre vai poder surpreender.
+#
+# A REGRA, de proposito conservadora, em duas partes:
+#   1. Corrida de 3+ caracteres de pontuacao IGUAIS colapsa. O ponto colapsa
+#      para exatamente TRES ("..." e a unica sequencia de pontuacao repetida que
+#      existe na ortografia do pt-BR, entao uma reticencia ditada sobrevive
+#      byte a byte); qualquer outro caractere colapsa para um so, porque ",,,",
+#      ";;;" e ":::" nao sao ortografia e "!!!"/"???" nao saem de FALA.
+#   2. So depois disso, uma cauda de pontos e' removida em dois casos que nunca
+#      sao texto legitimo: quando ela esta SOLTA (separada da ultima palavra por
+#      espaco, com 3+ pontos no total -- "cd .." tem dois e fica intacto) e
+#      quando ela esta EMPILHADA em cima de outra pontuacao ("Oi,..." -> "Oi,").
+# Tudo que esta colado numa palavra fica: "Espera ai...", "Que?!", "1.000,00",
+# "arquivo.tar.gz" e "https://ex.com/docs/..." passam sem um caractere alterado.
+_PUNCT_RUN_CHARS = ".,;:!?\u2026"
+_PUNCT_RUN_RE = re.compile(r"([%s])\1{2,}" % re.escape(_PUNCT_RUN_CHARS))
+_DOT_TAIL_STACKED_RE = re.compile(r"(?<=[,;:!?])\s*[.\u2026]+\s*$")
+_DOTS = ".\u2026"
+MIN_DETACHED_DOTS = 3
+
+
+def _collapse_punct_run(match) -> str:
+    return "..." if match.group(1) == "." else match.group(1)
+
+
+def _detached_tail_start(text: str) -> int:
+    """Onde comeca a cauda de pontos SOLTA, ou -1 se nao houver nenhuma.
+
+    Equivale a `(?:\\s+[.\u2026]+)+\\s*$`, e e' feito na mao justamente por isso:
+    aquele padrao tem quantificador aninhado e o `search` o experimenta em TODA
+    posicao do texto. Quando o modelo entra em loop de ". . . ." e a fala NAO
+    termina no loop nao existe casamento nenhum, entao ele varre o texto inteiro
+    a cada posicao -- O(n^2). Medido nesta maquina: 20 ms para 2 kB, 305 ms para
+    8 kB e 1,22 s para 16 kB, num texto que o `max_record_sec` de 175 s permite.
+    A varredura de tras para frente da' o mesmo resultado (equivalencia
+    verificada por fuzz diferencial em 400 mil strings, zero divergencias) em
+    0,006 ms.
+    """
+    i = len(text)
+    while i and (text[i - 1] in _DOTS or text[i - 1].isspace()):
+        i -= 1
+    # A cauda so' e' SOLTA a partir do primeiro espaco dela: ponto colado na
+    # palavra ("Espera ai...") nunca e' cauda solta, e e' esse o pedaco que o
+    # `\s+` do padrao original exigia antes dos pontos.
+    j = i
+    while j < len(text) and not text[j].isspace():
+        j += 1
+    if j >= len(text):
+        return -1
+    tail = text[j:]
+    if sum(tail.count(ch) for ch in _DOTS) < MIN_DETACHED_DOTS:
+        return -1
+    return j
+
+
+def strip_punct_runs(text: str) -> str:
+    """Desarma corrida de pontuacao sem nunca encostar em texto legitimo."""
+    out = _PUNCT_RUN_RE.sub(_collapse_punct_run, text)
+    out = _DOT_TAIL_STACKED_RE.sub("", out)
+    start = _detached_tail_start(out)
+    if start >= 0:
+        out = out[:start]
+    return out.strip()
+
 
 # Os cookies de os.add_dll_directory ficam vivos aqui de proposito. Ao contrario
 # do que parece, o CPython 3.11 NAO remove o diretorio quando o cookie e coletado
@@ -185,6 +276,12 @@ def postprocess(text: str, fixups, *, single_short_segment: bool = False) -> str
             continue
         out = out.replace(str(src), str(dst))
     out = _WS.sub(" ", out).strip()
+    # Depois dos fixups e do colapso de espaco: a regra de cauda precisa enxergar
+    # " ..." com UM espaco so, e um fixup pode ser justamente quem cria a cauda.
+    before = out
+    out = strip_punct_runs(out)
+    if out != before:
+        log.info("punctuation run collapsed: %r -> %r", before[:120], out[:120])
     if single_short_segment and len(out) <= HALLUCINATION_MAX_CHARS and _is_hallucination(out):
         log.info("dropped hallucination on near-empty audio: %r", out)
         return ""
@@ -198,12 +295,79 @@ def _decode_kwargs(cfg) -> dict:
         beam_size=int(cfg.get("beam_size") or 1),    # beam 5 ganha <=1,2pp de WER e custa ~0,3 s
         condition_on_previous_text=False,
         vad_filter=bool(cfg.get("vad_filter", True)),
-        temperature=list(TEMPERATURE_LADDER),
+        # Greedy puro. A escada de temperatura e' a causa MEDIDA das corridas de
+        # pontuacao do ditado curto, e nao um detalhe de gosto: num ditado real
+        # (poucas palavras dentro da janela de 30 s) o avg_logprob do decode
+        # greedy fica abaixo do log_prob_threshold (-1,0) por padrao, entao o
+        # faster-whisper marca needs_fallback e SORTEIA ate' temperatura 1,0.
+        # Nenhum dos outros guarda-chuvas pega o estrago: a compressao gzip de
+        # "Faca deploy .........." da 1,0 contra um limiar de 2,4 (a corrida e'
+        # curta demais para o gzip enxergar) e o no_speech_prob volta 0,0 porque
+        # ha fala de verdade no clipe. Aos 6 niveis ele ainda escolhe por
+        # avg_logprob entre amostras de temperaturas diferentes, que nao sao
+        # comparaveis entre si -- foi assim que "Oi," virou "Oi," e 51 pontos.
+        # Com [0.0] o laco de fallback devolve sempre o unico decode greedy: o
+        # mesmo audio passa a dar sempre o mesmo texto, o que uma ferramenta de
+        # ditado precisa.
+        #
+        # MEDIDO nesta maquina, com o modelo carregado, em dois clipes sinteticos
+        # de 4,9 s montados a partir de logs/recordings (fala curta + ruido de
+        # sala real), 12 tentativas cada:
+        #   escada: 4/12 e 6/12 com corrida de pontos, 4 e 7 textos DIFERENTES
+        #           para o mesmo wav (a amostragem do ctranslate2 nao tem
+        #           semente fixada aqui);
+        #   greedy: 0/12 e 0/12, um unico texto.
+        # Numa varredura de 972 clipes de 2-6 s a escada ainda produziu 9 loops
+        # de palavra ('tchau, tchau, tchau') contra 1 do greedy -- ou seja, ela
+        # piora a repeticao em vez de resgatar dela.
+        # WER nas tres fixtures: IDENTICO, texto por texto (0,0 / 10,7 / 0,0;
+        # media 3,6%). As tres ja decodificavam em temperatura 0,0.
+        temperature=(list(TEMPERATURE_LADDER) if cfg.get("temperature_fallback")
+                     else list(GREEDY_ONLY)),
         # prompt SEM ACENTOS e curto: 13,4% -> 8,5% de WER; acima de 224 tokens
         # o get_prompt trunca e fica pior que prompt nenhum.
         initial_prompt=(cfg.get("initial_prompt") or None),
         # NUNCA passar hotwords: pior sozinho E cancela o ganho do initial_prompt.
     )
+
+
+def resolve_model_source(model_id: str) -> tuple[str, bool]:
+    """Devolve (o que entregar ao WhisperModel, veio do cache local?).
+
+    Passar o `model_id` cru faz o faster-whisper bater em
+    `huggingface.co/api/models/<id>/revision/main` em TODO boot so para confirmar
+    a revisao -- um round trip de rede por inicializacao, num app que tem que
+    subir sem conexao com o modelo inteiro em models/. Com `local_files_only=True`
+    o download_model resolve o snapshot em disco (0,14 s medidos, sem rede) e
+    devolve o diretorio; um diretorio faz o WhisperModel pular o Hub inteiro.
+
+    Modelo ainda nao baixado levanta LocalEntryNotFoundError -- ai a unica saida
+    correta e' o caminho online, com o model_id cru. Nunca levanta: sob
+    pythonw.exe quem chama nao tem console para ver o traceback.
+    """
+    mid = str(model_id or "")
+    if not mid:
+        return mid, False
+    if os.path.isdir(mid):
+        return mid, True            # caminho local explicito no config.json
+    try:
+        from faster_whisper.utils import download_model
+
+        path = str(download_model(mid, local_files_only=True))
+    except Exception as exc:
+        log.info("model %s is not in the local cache at %s (%s); loading online",
+                 mid, os.environ.get("HF_HOME", "?"), exc.__class__.__name__)
+        return mid, False
+    # Cache pela metade (download interrompido) e' o unico jeito de esta troca
+    # piorar as coisas: o caminho online repararia sozinho, o offline entregaria
+    # um diretorio sem peso e o Engine cairia para CPU achando que foi VRAM.
+    missing = [f for f in SNAPSHOT_FILES if not os.path.isfile(os.path.join(path, f))]
+    if missing:
+        log.warning("snapshot %s is incomplete (missing %s); loading online",
+                    path, ", ".join(missing))
+        return mid, False
+    log.info("model resolved offline: %s", path)
+    return path, True
 
 
 def _check_prompt(prompt) -> None:
@@ -295,6 +459,8 @@ class Engine:
         self.warm_s = 0.0
         self.model = None
         self.batched = None
+        self.model_source = ""     # snapshot em disco, quando ele ja existe
+        self.offline = False       # True = o boot nao falou com a rede
         _check_prompt(self._decode.get("initial_prompt"))
 
         if str(self.cfg.get("engine") or "local").lower() == "groq":
@@ -315,6 +481,11 @@ class Engine:
         from faster_whisper import BatchedInferencePipeline, WhisperModel  # import caro: fica aqui de proposito
 
         log.info("faster_whisper imported in %.2fs", time.perf_counter() - t0)
+
+        # Depois do import (o download_model vem de dentro do faster_whisper) e
+        # antes do _load: os dois caminhos, cuda e o fallback cpu, usam o mesmo
+        # snapshot e nao podem resolver o Hub duas vezes.
+        self.model_source, self.offline = resolve_model_source(self.model_id)
 
         want = str(self.cfg.get("device") or "cuda").strip().lower()
         cpu_ctype = str(self.cfg.get("cpu_compute_type") or "int8")
@@ -352,8 +523,8 @@ class Engine:
 
         self.load_s = time.perf_counter() - t0
         self.ready = True
-        log.info("stt backend=%s model=%s load=%.2fs warm=%.3fs",
-                 self.backend, self.model_id, self.load_s, self.warm_s)
+        log.info("stt backend=%s model=%s offline=%s load=%.2fs warm=%.3fs",
+                 self.backend, self.model_id, self.offline, self.load_s, self.warm_s)
 
     # ---------------------------------------------------------------- interno
     def _load(self, WhisperModel, BatchedPipeline, device: str, ctype: str):
@@ -361,7 +532,8 @@ class Engine:
         model = None
         batched = None
         try:
-            model = WhisperModel(self.model_id, device=device, compute_type=ctype)
+            model = WhisperModel(self.model_source or self.model_id,
+                                 device=device, compute_type=ctype)
             try:
                 batched = BatchedPipeline(model=model)
             except Exception:

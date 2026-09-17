@@ -44,6 +44,30 @@ opcional de "polir transcrição" — nunca no caminho quente.
   `get_prompt` trunca em `max_length//2` = 224 tokens. Manter curto.
 - `hotwords` é pior que o prompt **e cancela o benefício dele** quando combinados. Não usar.
 - `beam_size=1` custa no máximo 1,2pp de WER e economiza ~0,3 s.
+- **A escada de temperatura fica DESLIGADA** (`temperature=[0.0]`, greedy puro). Num ditado
+  real cabem poucas palavras dentro da janela de 30 s, o `avg_logprob` do decode greedy cai
+  abaixo do `log_prob_threshold` (-1,0) e o faster-whisper marca `needs_fallback` e passa a
+  **sortear** até temperatura 1,0 — depois escolhe por `avg_logprob` entre amostras de
+  temperaturas diferentes, que não são comparáveis entre si (`generate_with_fallback`,
+  transcribe.py:1479-1530). Foi de lá que saíram as corridas de pontuação do primeiro ditado
+  real em hardware (`Oi,` seguido de 51 pontos, `Faça deploy` seguido de 10). Os outros
+  guarda-chuvas não pegam: a razão de compressão de uma corrida curta dá ~1,0 contra um limiar
+  de 2,4, e `no_speech_prob` volta 0,0 porque há fala de verdade no clipe. Com um único degrau
+  o mesmo áudio dá sempre o mesmo texto — o `ctranslate2` não tem semente fixada aqui.
+  `temperature_fallback: true` no config.json devolve o comportamento original.
+- O `postprocess()` ainda tem um cinto contra corrida de pontuação (`strip_punct_runs`), e ele
+  é deliberadamente conservador: nunca remove letra nem dígito, só colapsa pontuação repetida e
+  corta cauda de pontos SOLTA ou EMPILHADA em outra pontuação. O preço aceito é a reticência
+  ditada que chega separada por espaço ("e depois ..." vira "e depois"), que no `" ".join()`
+  dos segmentos quase sempre é segmento de alucinação, não fala.
+- Modelo resolvido no cache local antes de carregar: `download_model(id, local_files_only=True)`
+  devolve o diretório do snapshot, e um **diretório** faz o `WhisperModel` pular o Hub. Sem
+  isso ele bate em `huggingface.co/api/models/<id>/revision/main` a **cada** boot (visto no log
+  do bring-up às 00:08:57). Snapshot sem `model.bin`, `config.json` ou `tokenizer.json` conta
+  como incompleto e cai no caminho online, que se repara sozinho — `tokenizer.json` ausente não
+  é erro no faster-whisper, ele busca o tokenizer do `openai/whisper-tiny` pela rede, e com
+  vocabulário errado para o large-v3. `preprocessor_config.json` não entra nessa lista: o
+  `faster-whisper-small` não tem esse arquivo e está correto, porque 80 mel bins é o default.
 - **Nunca** usar `Systran/faster-distil-whisper-large-v3`: ele traduz pt-BR para inglês
   silenciosamente (WER 73–106%).
 - Armadilha Windows: `ctranslate2.dll` carrega `cublas64_12.dll` **dinamicamente** (não está na
@@ -167,8 +191,17 @@ Quatro threads, validadas juntas num teste de integração que passou:
 | worker | captura, ASR e injeção | onde todo o trabalho pesado acontece |
 
 - Instância única: `CreateMutexW(None, True, "Local\\WisprClone")` mais `ERROR_ALREADY_EXISTS (183)`.
-- Watchdog do hook: se o SO viu input recente (`GetLastInputInfo`) mas o hook proc não disparou
-  há mais de 5 s, o Windows despejou o hook, então reinstalar.
+- Watchdog do hook: input recente no SO (`GetLastInputInfo`) com o hook proc calado há mais de
+  5 s é **suspeita, não diagnóstico**. `GetLastInputInfo` conta teclado **e mouse**, e um
+  `WH_KEYBOARD_LL` jamais dispara em evento de mouse: cinco segundos de mouse sem teclado batem
+  nos dois limites com o hook perfeitamente vivo. Na sessão de 2 min do primeiro ditado real
+  isso deu duas reinstalações (00:09:02 e 00:10:47) com o `Win+A` funcionando entre elas. Quem
+  dá o veredito é uma **sonda**: um toque de `vk 0xE8` com tag própria (`PROBE_TAG`), que o
+  hook proc engole antes de qualquer lógica de chord. Só sonda perdida reinstala. Com janela
+  elevada em foco (o UIPI engole a injeção **e** o hook não recebe nada de qualquer jeito) ou
+  com `SendInput` recusado, o veredito é "não dá para saber" e nada é reinstalado — reinstalar
+  ali não devolveria evento nenhum. O relógio zera a cada veredito, então a sonda roda no
+  máximo a cada 5 s, nunca a cada ronda de 3 s.
 - Autostart: entrada em `HKCU\...\CurrentVersion\Run` apontando para `pythonw.exe main.pyw`
   (gravável sem elevação, verificado). Tarefa agendada com `/RL HIGHEST /SC ONLOGON` só se você
   quiser que o hook sobreviva sobre janelas elevadas — precisa de uma criação elevada única.
