@@ -78,6 +78,19 @@ CUDA_DLL_DIRS: list[str] = []
 _DLL_LOCK = threading.Lock()   # preload() roda numa thread de boot: sem lock isso duplica
 
 
+def _prepend_path(dirs: list[str]) -> None:
+    """Poe `dirs` na frente do %PATH% do processo, sem duplicar.
+
+    So mexe em os.environ, que e' local a este processo: nada e' gravado no
+    registro e nenhum outro programa e' afetado.
+    """
+    current = os.environ.get("PATH", "")
+    have = {p.casefold() for p in current.split(os.pathsep) if p}
+    missing = [d for d in dirs if d.casefold() not in have]
+    if missing:
+        os.environ["PATH"] = os.pathsep.join(missing + ([current] if current else []))
+
+
 class TranscriptionError(RuntimeError):
     """Falha de transcricao com mensagem em pt-BR que a bandeja pode exibir."""
 
@@ -118,6 +131,16 @@ def _add_cuda_dll_dirs() -> list[str]:
                     CUDA_DLL_DIRS.append(path)
                 except OSError as exc:
                     log.warning("add_dll_directory failed for %s: %s", path, exc)
+        # O add_dll_directory sozinho NAO resolve, e isso foi medido nesta maquina:
+        # ele so vale para quem chama LoadLibraryEx com LOAD_LIBRARY_SEARCH_USER_DIRS.
+        # O ctypes faz isso (ctypes.WinDLL('cublas64_12.dll') carregava normalmente),
+        # mas o ctranslate2.dll usa LoadLibrary simples, que ignora esses diretorios
+        # e cai na ordem de busca classica -- onde o PATH entra. Sem esta linha o
+        # modelo carrega em cuda e so o transcribe() estoura com "Library
+        # cublas64_12.dll is not found or cannot be loaded", e o Engine cai para CPU
+        # (6x mais lento: RTF 0,35 contra 0,055 na mesma fala de 15 s).
+        if CUDA_DLL_DIRS:
+            _prepend_path(CUDA_DLL_DIRS)
         log.debug("cuda dll dirs: %d", len(CUDA_DLL_DIRS))
         return CUDA_DLL_DIRS
 

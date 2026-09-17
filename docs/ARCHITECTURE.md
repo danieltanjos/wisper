@@ -48,9 +48,19 @@ opcional de "polir transcrição" — nunca no caminho quente.
   silenciosamente (WER 73–106%).
 - Armadilha Windows: `ctranslate2.dll` carrega `cublas64_12.dll` **dinamicamente** (não está na
   import table do PE). O modelo carrega em `cuda` e só o `transcribe()` estoura com
-  `Library cublas64_12.dll is not found`. Correção: `os.add_dll_directory()` nos `nvidia/*/bin`
-  das wheels **antes** de importar `faster_whisper`. `nvidia` é namespace package, então
-  usar `nvidia.__path__`, nunca `nvidia.__file__` (que é `None`).
+  `Library cublas64_12.dll is not found`. A correção precisa de **duas** partes:
+  `os.add_dll_directory()` nos `nvidia/*/bin` das wheels **e** os mesmos diretórios no
+  `os.environ["PATH"]`, ambos **antes** de importar `faster_whisper`. `nvidia` é namespace
+  package, então usar `nvidia.__path__`, nunca `nvidia.__file__` (que é `None`).
+- **O `add_dll_directory` sozinho não resolve** — isto foi medido no bring-up, contra o que uma
+  sessão anterior tinha concluído. Ele só afeta quem chama `LoadLibraryEx` com
+  `LOAD_LIBRARY_SEARCH_USER_DIRS`; o `ctypes` faz isso (`ctypes.WinDLL('cublas64_12.dll')`
+  carregava sem problema), mas o `ctranslate2.dll` usa `LoadLibrary` simples, que ignora esses
+  diretórios e cai na ordem de busca clássica — onde o `PATH` entra. O sintoma é traiçoeiro:
+  o `Engine` cai para CPU **em silêncio**, porque o fallback para CPU é exatamente o
+  comportamento correto quando falta VRAM. Só o campo `backend` denuncia. Custo real medido:
+  a mesma fala de 15,1 s levou 5,18 s na CPU contra 0,97 s na GPU.
+  Travado por `tests/test_regressions.py::CudaDllPathTest`.
 - VRAM livre real com o desktop em uso (Wallpaper Engine, Opera GX, WhatsApp, WebView) foi de
   apenas **1.746 MiB de 8.188**. Orçar ~1,5 GB, não 6,5 GB. Daí o `int8_float16`.
 

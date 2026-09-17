@@ -1579,3 +1579,66 @@ class RepasteClearsTheFlagsTest(_AppCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# --------------------------------------------------------------------------- #
+# Etapa 1 do bring-up em hardware: a CUDA caiu para CPU porque o
+# os.add_dll_directory sozinho nao basta. Ver wispr/stt.py::_prepend_path.
+# --------------------------------------------------------------------------- #
+
+class CudaDllPathTest(unittest.TestCase):
+    """O add_dll_directory so vale para quem chama LoadLibraryEx com
+    LOAD_LIBRARY_SEARCH_USER_DIRS. O ctranslate2.dll usa LoadLibrary simples e
+    ignora esses diretorios, entao eles TAMBEM tem que entrar no %PATH%.
+
+    Sem isso o modelo carrega em cuda e so o transcribe() estoura com
+    "Library cublas64_12.dll is not found or cannot be loaded", o Engine cai
+    para CPU e o ditado fica 6x mais lento -- em silencio, porque o fallback
+    e' justamente o comportamento correto para VRAM insuficiente.
+    """
+
+    def setUp(self):
+        mod, why = _safety.load_pure("wispr.stt")
+        if mod is None:
+            self.skipTest(why or "wispr.stt nao importavel neste ambiente")
+        self.stt = mod
+
+    def test_every_added_dll_dir_is_also_on_path(self):
+        dirs = self.stt._add_cuda_dll_dirs()
+        if not dirs:
+            self.skipTest("wheels nvidia nao instaladas neste ambiente")
+        path = {p.casefold() for p in _os.environ.get("PATH", "").split(_os.pathsep) if p}
+        for d in dirs:
+            self.assertIn(d.casefold(), path,
+                          "%s entrou no search path de DLL mas nao no PATH" % d)
+
+    def test_prepend_path_puts_the_dirs_first(self):
+        old = _os.environ.get("PATH", "")
+        try:
+            _os.environ["PATH"] = r"C:\ja\estava"
+            self.stt._prepend_path([r"C:\novo\bin"])
+            self.assertTrue(_os.environ["PATH"].startswith(r"C:\novo\bin" + _os.pathsep),
+                            "o diretorio novo tem que vir ANTES do PATH existente")
+            self.assertIn(r"C:\ja\estava", _os.environ["PATH"])
+        finally:
+            _os.environ["PATH"] = old
+
+    def test_prepend_path_does_not_duplicate(self):
+        old = _os.environ.get("PATH", "")
+        try:
+            _os.environ["PATH"] = r"C:\bin\um"
+            for _ in range(5):
+                self.stt._prepend_path([r"C:\bin\um", r"C:\BIN\UM"])
+            self.assertEqual(_os.environ["PATH"], r"C:\bin\um",
+                             "case-insensitive: o Windows nao diferencia, o PATH nao pode inchar")
+        finally:
+            _os.environ["PATH"] = old
+
+    def test_prepend_path_survives_an_empty_path(self):
+        old = _os.environ.get("PATH", "")
+        try:
+            _os.environ["PATH"] = ""
+            self.stt._prepend_path([r"C:\so\esse"])
+            self.assertEqual(_os.environ["PATH"], r"C:\so\esse")
+        finally:
+            _os.environ["PATH"] = old
