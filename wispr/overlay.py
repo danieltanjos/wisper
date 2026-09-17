@@ -267,6 +267,24 @@ def _primary_size(fallback_w: int, fallback_h: int) -> tuple[int, int]:
     return fallback_w, fallback_h
 
 
+SPI_GETWORKAREA = 0x0030
+
+
+def _workarea_bottom(fallback: int) -> int:
+    """Borda de cima da barra de tarefas do monitor primário, em px físicos.
+
+    A pílula fica ancorada nela, e não na base da tela: assim "um pouquinho
+    acima da barra" vale com a barra de qualquer altura ou escondida.
+    """
+    try:
+        rc = wt.RECT()
+        if _u32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rc), 0) and rc.bottom > 0:
+            return int(rc.bottom)
+    except Exception:
+        log.debug("SystemParametersInfoW(SPI_GETWORKAREA) falhou", exc_info=True)
+    return fallback
+
+
 # --------------------------------------------------------------------------
 # Paleta e métricas (em px lógicos @96 dpi; multiplicadas pela escala de DPI)
 # --------------------------------------------------------------------------
@@ -283,15 +301,16 @@ _SPIN = "#ffffff"
 _TXT = "#ffffff"
 _IDLE = "#6f6f6f"
 
-_BASE_W = 100
-_BASE_H = 36
+_BASE_W = 84
+_BASE_H = 30
 _NBARS = 11
-_BAR_W = 3
+_BAR_W = 2
 _BAR_GAP = 3
 _FONT_PX = 11
-_SPIN_R = 9
-_IDLE_W = 44
-_IDLE_H = 8
+_SPIN_R = 8
+_IDLE_W = 36
+_IDLE_H = 6
+_ANIM_FRAMES = 8      # ~260 ms de transicao de tamanho entre modos
 
 _LABEL_WORK = "transcrevendo…"
 _TICK_MS = 33
@@ -410,6 +429,7 @@ class Overlay:
         self._lvl = 0.0
         self._lay_key = None
         self._geom = None
+        self._anim = None     # (frame0, w0, h0, w1, h1) durante a transicao de tamanho
         self._scale = 1.0
         self._dpi = 96
         self._sw = 1920
@@ -669,8 +689,13 @@ class Overlay:
             log.debug("overlay: Font.measure falhou", exc_info=True)
             return text[:40]
 
-    def _tk_layout(self, mode: str, text: str) -> None:
-        """Redesenha a cápsula inteira e reposiciona a janela. Só na thread Tk."""
+    def _tk_layout(self, mode: str, text: str, size=None) -> tuple[int, int]:
+        """Redesenha a cápsula inteira e reposiciona a janela. Só na thread Tk.
+
+        `size=(W, H)` é o quadro intermediário da transição: desenha só a
+        cápsula nesse tamanho, sem conteúdo e sem gravar a chave. Devolve o
+        tamanho FINAL do modo, que é o alvo da animação.
+        """
         # A chave é gravada com o texto ORIGINAL, que é o que o tick compara.
         # Gravar o texto já truncado faria a comparação falhar em todo frame e
         # a pílula seria redesenhada e reposicionada 30x por segundo.
@@ -694,6 +719,10 @@ class Overlay:
             inner = tw if mode == "msg" else self._bars_w
             W = max(self._base_w, inner + 2 * r)
             W = min(W, max(self._base_w, int(self._sw * 0.9)))
+        target = (W, H)
+        if size is not None:
+            W, H = int(size[0]), int(size[1])
+            r = H // 2
 
         cv.delete("all")
         cv.configure(width=W, height=H)
@@ -707,13 +736,15 @@ class Overlay:
         cv.create_oval(0, 0, H, H, fill=edge, outline="")
         cv.create_oval(W - H, 0, W, H, fill=edge, outline="")
         cv.create_rectangle(r, 0, W - r, H, fill=edge, outline="")
-        if b:
+        if b and H > 2 * b + 1:
             cv.create_oval(b, b, H - b, H - b, fill=fill, outline="")
             cv.create_oval(W - H + b, b, W - b, H - b, fill=fill, outline="")
             cv.create_rectangle(r, b, W - r, H - b, fill=fill, outline="")
 
         cy = H / 2.0
-        if mode == "work":
+        if size is not None:
+            pass                                   # quadro da transicao: so' a capsula
+        elif mode == "work":
             rs = self._spin_r
             gx = W / 2.0 - rs
             self._arc = cv.create_arc(gx, cy - rs, gx + 2 * rs, cy + rs,
@@ -738,11 +769,12 @@ class Overlay:
         # monitor PRIMÁRIO. O offset também é escalado: em 150% ele ficaria
         # colado na barra de tarefas se ficasse em px físicos.
         try:
-            off = int(round(float(self.cfg.get("overlay_offset_y", 110)) * s))
+            off = int(round(float(self.cfg.get("overlay_offset_y", 8)) * s))
         except Exception:
-            off = int(round(110 * s))
+            off = int(round(8 * s))
         x = max(0, (self._sw - W) // 2)
-        y = max(0, self._sh - H - off)
+        # Ancorada na barra de tarefas (area de trabalho), nao na base da tela.
+        y = max(0, _workarea_bottom(self._sh) - H - off)
         self._geom = (x, y, W, H)
         self._root.geometry("%dx%d+%d+%d" % (W, H, x, y))
         # `wm geometry` do Tk só vira MoveWindow no próximo idle. Como estamos
@@ -754,7 +786,9 @@ class Overlay:
             self._root.update_idletasks()
         except Exception:
             log.debug("overlay: update_idletasks apos geometry falhou", exc_info=True)
-        self._lay_key = key
+        if size is None:
+            self._lay_key = key
+        return target
 
     def _tk_check_screen(self) -> None:
         """Resolução ou DPI mudaram (dock, projetor, troca de escala)? Refaz."""
@@ -829,14 +863,34 @@ class Overlay:
                 text = _LABEL_WORK if mode == "work" else (st["text"] if mode == "msg" else "")
                 key = (mode, text, self._scale, self._sw, self._sh)
                 if key != self._lay_key:
-                    self._tk_layout(mode, text)
+                    prev = self._geom
+                    tgt = self._tk_layout(mode, text)
+                    if prev is not None and self._vis and mode != "msg":
+                        # Ja' havia uma capsula na tela: em vez de pular de
+                        # tamanho, ela escorrega ate' o novo em _ANIM_FRAMES.
+                        self._anim = (self._frame, prev[2], prev[3], tgt[0], tgt[1])
+                        self._tk_layout(mode, text, size=(prev[2], prev[3]))
+                    else:
+                        self._anim = None
+                if self._anim is not None:
+                    f0, w0, h0, w1, h1 = self._anim
+                    t = min(1.0, (self._frame - f0) / float(_ANIM_FRAMES))
+                    e = 1.0 - (1.0 - t) ** 3            # ease-out
+                    if t >= 1.0:
+                        self._anim = None
+                        self._tk_layout(mode, text)
+                    else:
+                        self._tk_layout(mode, text, size=(round(w0 + (w1 - w0) * e),
+                                                          round(h0 + (h1 - h0) * e)))
+            else:
+                self._anim = None
 
             if want and not self._vis:
                 self._tk_reveal()
             elif not want and self._vis:
                 self._hide_now()
 
-            if self._vis:
+            if self._vis and self._anim is None:
                 if mode == "rec":
                     self._tk_anim_bars(st)
                 elif mode == "work":
