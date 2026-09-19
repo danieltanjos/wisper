@@ -18,7 +18,7 @@ documentação copiada. `docs/CONTRACT.md` tem a API entre os módulos.
    hooks de teclado e injetou teclas enquanto ele jogava e atrapalhou tudo. Se você delegar para
    subagentes, **repita a regra dentro do prompt de cada um** — eles não herdam isso.
 2. O que é seguro rodar sozinho: `python -m py_compile`, e a suíte offline
-   `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (359 testes).
+   `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (368 testes).
    `tests/_safety.py` transforma `SendInput`, `SetWindowsHookExW` e `OpenClipboard` em bomba de
    `RuntimeError`, então a suíte é segura mesmo com alguém jogando.
 3. **Não lance o app de dentro de uma chamada de ferramenta comum** — o harness mata a árvore de
@@ -74,6 +74,16 @@ a CUDA falha. Rodou ao vivo no notebook em 2026-09-17: 0,5 s por ditado.
   ditado deu 403 do Cloudflare (erro 1010, User-Agent `Python-urllib`); corrigido com User-Agent
   próprio. No desktop o mesmo config fica na 4060 porque a CUDA carrega.
 
+**Volta ao desktop (4060 Ti), 2026-09-18:** `git pull` dos 17 commits do notebook mais
+`setup.ps1 -DownloadModel`. O `requirements.txt` **rebaixou** os wheels de CUDA que estavam
+instalados aqui (`nvidia-cublas-cu12` 12.9.2.10 → 12.4.5.8, `nvidia-cudnn-cu12` 9.26.0.51 →
+9.1.0.70) — o pin é o combo validado, e depois dele o `bench_wer.py` ainda diz `backend=cuda`,
+RTF 0,033–0,050, WER por fixture idêntico (0,0 / 10,7 / 0,0). Não houve queda silenciosa para
+CPU. O `load=12,3 s` / `warm=1,42 s` desta rodada é cache de disco frio (os 2,5 GB recém-lidos),
+não regressão dos 3,0 s / 0,45 s. **Atenção ao ler o bench:** ele imprime **média ponderada**
+(4,5%); os 3,6% citados aqui são a média simples dos três fixtures — mesmo resultado, contas
+diferentes. Compare fixture a fixture.
+
 ## O que está provado em hardware
 
 Medido, não inferido:
@@ -122,8 +132,6 @@ colado na palavra mais dois soltos, que a cauda solta não conta). Ambiente ruim
 `config.json` já está com `log_level: DEBUG` e `keep_recordings: true`, e o `_transcribe_local`
 loga em DEBUG `stt segments=[...] -> '...'` com o texto exato. Peça um ditado, leia o log, e só
 então ajuste o `strip_punct_runs`. Os wavs ficam em `logs/recordings/`.
-
-### 2. `config.json` com BOM era ignorado inteiro, em silêncio — CORRIGIDO (2026-09-17)
 
 ### 2. `config.json` com BOM era ignorado inteiro, em silêncio — CORRIGIDO (2026-09-17)
 
@@ -176,7 +184,7 @@ marcado com `PROBE_TAG`, ver `_probe_hook` em `wispr/hotkey.py`).
 ## Como está o repositório
 
 - `main` em `https://github.com/danieltanjos/wisper` (privado).
-- 359 testes offline, todos verificados por mutação — cada correção foi remutada em memória para
+- 368 testes offline, todos verificados por mutação — cada correção foi remutada em memória para
   provar que o teste fica vermelho sem ela. Mantenha esse padrão: a suíte anterior tinha 180
   testes verdes e **não pegou nenhum** dos defeitos que o hardware achou.
 - Três auditorias adversariais (contrato, concorrência, modos de falha) mais duas rodadas de
