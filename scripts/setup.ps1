@@ -11,7 +11,7 @@
     excecao. Ver docs/ARCHITECTURE.md secao 4.
 
 .PARAMETER Python
-    Interpretador base. Tem que ser python.org CPython 3.11 x64.
+    Interpretador base. Tem que ser python.org CPython 3.11 ou 3.14 x64.
 
 .PARAMETER DownloadModel
     Baixa agora os pesos do Whisper (~1,6 GB) para dentro de models/.
@@ -189,7 +189,7 @@ if (-not (Test-Path -LiteralPath $Python)) {
     Write-Host "ERRO: interpretador nao encontrado:" -ForegroundColor Red
     Write-Host "  $Python"
     Write-Host ""
-    Write-Host "Instale o CPython 3.11 x64 do python.org (NAO o da Microsoft Store) ou"
+    Write-Host "Instale o CPython 3.11 ou 3.14 x64 do python.org (NAO o da Microsoft Store) ou"
     Write-Host "passe o caminho certo com -Python:"
     Write-Host "  .\scripts\setup.ps1 -Python `"C:\caminho\para\python.exe`""
     Write-Host ""
@@ -204,9 +204,9 @@ $info = ConvertFrom-KeyValueLines -Lines $probe.Lines
 
 if (Test-StorePython -Info $info) { Deny-StorePython -Exe $Python -Info $info }
 
-if ($info["major"] -ne "3" -or $info["minor"] -ne "11") {
-    Write-Fail ("preciso de Python 3.11, achei $($info['major']).$($info['minor']).$($info['micro']) em $Python. " +
-                "O projeto so foi validado no 3.11 (ctranslate2 4.8.2 + faster-whisper 1.2.1).")
+if ($info["major"] -ne "3" -or $info["minor"] -notin @("11", "14")) {
+    Write-Fail ("preciso de Python 3.11 ou 3.14, achei $($info['major']).$($info['minor']).$($info['micro']) em $Python. " +
+                "O projeto so foi validado nesses dois (ctranslate2 4.8.2 + faster-whisper 1.2.1).")
 }
 if ($info["bits"] -ne "64") {
     Write-Fail "preciso de Python x64; este e de $($info['bits']) bits. As wheels de CUDA so existem em x64."
@@ -236,8 +236,8 @@ if (Test-Path -LiteralPath $VenvPy) {
         Write-Note "o .venv existente foi criado a partir do Python da Microsoft Store."
         Deny-StorePython -Exe $VenvPy -Info $vinfo
     }
-    if ($vinfo["minor"] -ne "11") {
-        Write-Fail "o .venv existente e 3.$($vinfo['minor']). Rode de novo com -Force para recria-lo em 3.11."
+    if ($vinfo["minor"] -ne $info["minor"]) {
+        Write-Fail "o .venv existente e 3.$($vinfo['minor']), o -Python e 3.$($info['minor']). Rode de novo com -Force para recria-lo."
     }
     Write-Ok "reaproveitando o .venv ja existente"
 } else {

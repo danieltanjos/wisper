@@ -1,8 +1,9 @@
 # wisper -- dependencias verificadas nesta maquina (Windows 11 Pro 26200, RTX 4060 Ti).
 #
 # ###############################################################################
-# INTERPRETADOR OBRIGATORIO: python.org CPython 3.11 x64
-#   C:\Users\Administrador\AppData\Local\Programs\Python\Python311org\python.exe
+# INTERPRETADOR OBRIGATORIO: python.org CPython 3.11 ou 3.14 x64
+#   desktop : C:\Users\Administrador\AppData\Local\Programs\Python\Python311org\python.exe (3.11)
+#   notebook: C:\Users\Daniel\AppData\Local\Programs\Python\Python314\python.exe (3.14)
 #
 # NAO use o Python da Microsoft Store. Ele tem identidade de pacote
 # (PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0) e por isso ganha uma
@@ -66,12 +67,12 @@ Pillow>=10
 #     o app.py usa hoje para keep_recordings;
 #   pycaw: wrapper de alto nivel sobre o mesmo COM que wispr/audio.py ja fala na
 #     mao (IMMDeviceEnumerator, IAudioMeterInformation).
-# Consequencia de manter: se um deles nao tiver wheel cp311/win_amd64, o
+# Consequencia de manter: se um deles nao tiver wheel cp311/cp314 win_amd64, o
 # `pip install -r` inteiro falha por um pacote que ninguem importa. Se isso
 # acontecer no seu setup, comente as tres linhas e siga - nada quebra.
 soundfile==0.14.0
 pycaw
-webrtcvad-wheels==2.0.14
+webrtcvad-wheels==2.0.14.post1
 
 # --- deliberadamente AUSENTE ---
 # keyboard: casa hotkey por scan code, nao dispara em input injetado com scancode 0,

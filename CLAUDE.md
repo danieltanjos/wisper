@@ -36,7 +36,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run.ps1 -Console
 
 O `setup.ps1` **recusa o Python da Microsoft Store** e está certo em recusar: aquele build tem
 identidade de pacote, e o `InputStream()` do microfone trava para sempre sem exceção nenhuma.
-Use python.org CPython 3.11 x64. Passe `-Python <caminho>` se não estiver no lugar padrão.
+Use python.org CPython 3.11 ou 3.14 x64. Passe `-Python <caminho>` se não estiver no lugar padrão.
+O notebook roda em 3.14.6 desde 2026-10-03 (o 3.11 foi removido de lá); o desktop segue em 3.11.
 
 Se o PC novo não tiver GPU NVIDIA, o `Engine` cai para CPU sozinho — funciona, mas fica ~6x mais
 lento (RTF 0,34 contra 0,055). Para nuvem em vez de CPU: `"engine": "groq"` no `config.json` mais

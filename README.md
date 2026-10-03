@@ -37,7 +37,7 @@ mais rápido (0,4–0,6 s por fala) do que qualquer ida e volta na nuvem.
 ## Instalação
 
 Requisitos: Windows 11, RTX 4060 Ti (ou qualquer GPU NVIDIA com ~1,5 GB livres) e
-**CPython 3.11 do python.org** — não o da Microsoft Store.
+**CPython 3.11 ou 3.14 do python.org** — não o da Microsoft Store.
 
 > O Python da Store tem identidade de pacote e uma entrada própria no ConsentStore do microfone:
 > em "Prompt" a abertura do stream **trava para sempre, sem exceção**, esperando uma UI de
