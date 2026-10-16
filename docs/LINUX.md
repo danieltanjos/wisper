@@ -173,9 +173,13 @@ Win32.
 
 Pílula: o mesmo `wispr/overlay.py`, com Tk no XWayland. Uma janela `overrideredirect` do X11 não é
 gerenciada pelo KWin e **nunca recebe foco** — não há NOACTIVATE a pedir. Mostrar/esconder é
-`deiconify()`/`withdraw()` do Tk (no X11 isso não ativa nada). A posição vem do `_NET_WORKAREA`
-(medido: `0, 0, 1920, 1034`, painel de 46 px), lido pelo `xprop`. Não há `-transparentcolor` no X11:
-a pílula sai num retângulo preto. **Não medido:** o `python3-tkinter` não está instalado; sem ele o
+`deiconify()`/`withdraw()` do Tk (no X11 isso não ativa nada). Centro horizontal: o monitor primário
+do `xrandr --listmonitors` (a tela X é a união dos monitores; medido `3672x1920` com o notebook em
+`2592x1458+1080+0`). Base: o `_NET_WORKAREA` do `xprop` (medido: `0, 0, 1920, 1034`, painel de 46 px),
+que o KWin publica em px lógicos, vezes o `[Xwayland] Scale` do kwinrc (1,35 → 1396 em px X). Não há `-transparentcolor` no X11:
+o wrapper do Tk (pai do `winfo_id()`; o `wm frame` devolve o próprio `winfo_id()` sem reparent) é
+recortado no formato da cápsula pela extensão SHAPE, por ctypes na libXext. Sem isso sobravam cantos
+pretos. **Não medido:** o `python3-tkinter` não está instalado; sem ele o
 app segue sem pílula (o ícone da bandeja muda de cor: verde, vermelho gravando, âmbar transcrevendo).
 
 ## 7. Suíte

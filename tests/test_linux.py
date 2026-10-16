@@ -840,16 +840,41 @@ class OverlayWorkareaTest(unittest.TestCase):
             self.skipTest(why)
         self.ov._X11_WORKAREA.update(t=0.0, bottom=None)
 
+    @staticmethod
+    def _run(scale):
+        outs = {"xprop": "_NET_WORKAREA(CARDINAL) = 0, 0, 2720, 1034\n", "kreadconfig6": scale,
+                "xrandr": "Monitors: 2\n 0: +*eDP-1 2592/344x1458/193+1080+0  eDP-1\n"
+                          " 1: +DP-1 1080/355x1920/200+0+0  DP-1\n"}
+        return lambda cmd, *a, **k: types.SimpleNamespace(stdout=outs[cmd[0]])
+
     def test_the_pill_sits_above_the_panel(self):
-        out = types.SimpleNamespace(stdout="_NET_WORKAREA(CARDINAL) = 0, 0, 1920, 1034\n")
-        with mock.patch.object(self.ov.subprocess, "run", lambda *a, **k: out):
+        with mock.patch.object(self.ov.subprocess, "run", self._run("1\n")):
             self.assertEqual(self.ov._workarea_bottom(1080), 1034)
+
+    def test_logical_workarea_is_scaled_to_x_pixels(self):
+        # medido: escala 1,35, painel de 46 px logicos na base do notebook
+        with mock.patch.object(self.ov.subprocess, "run", self._run("1.35\n")):
+            self.assertEqual(self.ov._workarea_bottom(1458), 1396)
+
+    def test_centers_on_the_primary_not_the_whole_x_screen(self):
+        self.ov._X11_PRIMARY.clear()
+        with mock.patch.object(self.ov.subprocess, "run", self._run("1\n")):
+            self.assertEqual(self.ov._x11_primary(3672, 1920), (1080, 0, 2592, 1458))
 
     def test_no_xprop_falls_back_to_the_screen(self):
         def boom(*a, **k):
             raise FileNotFoundError("xprop")
         with mock.patch.object(self.ov.subprocess, "run", boom):
             self.assertEqual(self.ov._workarea_bottom(1080), 1080)
+
+    def test_capsule_mask_has_round_ends_and_stays_inside(self):
+        rows = self.ov._capsule_rows(134, 40)
+        self.assertEqual(len(rows), 40)
+        self.assertEqual(rows[20], (0, 20, 134, 1))           # meio: largura toda
+        self.assertGreater(rows[0][0], 10)                      # topo: canto cortado
+        for x, y, w, h in rows:
+            self.assertTrue(x >= 0 and x + w <= 134 and h == 1)
+            self.assertEqual(x, 134 - (x + w))                  # simetrica
 
 
 if __name__ == "__main__":

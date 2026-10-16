@@ -25,8 +25,8 @@ entra na política de foco), então o ex-style vira desnecessário. Mostrar e
 esconder é `deiconify()`/`withdraw()` do próprio Tk — que aqui NÃO ativa nada,
 ao contrário do Windows. A posição usa a área de trabalho do `_NET_WORKAREA`
 (o KWin publica para o XWayland), para a pílula ficar acima do painel. Não há
-`-transparentcolor` no X11: a pílula sai num retângulo preto (o fundo da
-própria cápsula). Precisa do pacote `python3-tkinter`; sem ele o app segue
+`-transparentcolor` no X11: a janela é recortada no formato da cápsula pela
+extensão SHAPE (`_x11_shape_capsule`), senão sobravam cantos pretos. Precisa do pacote `python3-tkinter`; sem ele o app segue
 sem pílula, como sempre. Ver docs/LINUX.md.
 """
 from __future__ import annotations
@@ -38,6 +38,7 @@ import io
 import logging
 import math
 import queue
+import re
 import threading
 import subprocess
 import sys
@@ -276,18 +277,49 @@ def _dpi_primary(hwnd=None) -> int:
     return _dpi_for(hwnd)
 
 
-def _primary_size(fallback_w: int, fallback_h: int) -> tuple[int, int]:
-    """Tamanho do monitor PRIMÁRIO em pixels físicos (já somos DPI-aware)."""
+def _primary_rect(fallback_w: int, fallback_h: int) -> tuple[int, int, int, int]:
+    """(x, y, w, h) do monitor PRIMÁRIO em pixels físicos (já somos DPI-aware)."""
     if not _WIN:
-        return fallback_w, fallback_h    # o Tk/XWayland já dá o tamanho da tela
+        return _x11_primary(fallback_w, fallback_h)
     try:
         w = int(_u32.GetSystemMetrics(SM_CXSCREEN))
         h = int(_u32.GetSystemMetrics(SM_CYSCREEN))
         if w > 0 and h > 0:
-            return w, h
+            return 0, 0, w, h            # no Windows o primário sempre começa em 0,0
     except Exception:
         log.debug("GetSystemMetrics falhou", exc_info=True)
-    return fallback_w, fallback_h
+    return 0, 0, fallback_w, fallback_h
+
+
+_X11_PRIMARY: dict = {}
+
+
+def _x11_primary(screen_w: int, screen_h: int) -> tuple[int, int, int, int]:
+    """Linux: (x, y, w, h) do monitor primário em coordenadas X, pelo `xrandr`.
+
+    A tela X é a união dos monitores (medido: 3672x1920 com o notebook
+    `2592x1458+1080+0` ao lado de um monitor em pé), e centralizar nela jogava a
+    pílula no meio do conjunto, fora do centro do primário. Guardado por tamanho
+    da tela X: o check de tela roda a cada 0,5 s e só monitor entrando/saindo ou
+    troca de escala mudam esse tamanho.
+    shortcut: trocar o primário sem mudar o tamanho da tela X só é visto ao reiniciar.
+    """
+    key = (screen_w, screen_h)
+    if key not in _X11_PRIMARY:
+        rect = (0, 0, screen_w, screen_h)
+        try:
+            out = subprocess.run(["xrandr", "--listmonitors"], capture_output=True,
+                                 text=True, timeout=1.0, check=False).stdout
+            # " 0: +*eDP-1 2592/344x1458/193+1080+0  eDP-1": o `*` marca o primário
+            m = re.search(r"\+\*\S+\s+(\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)", out)
+            if m:
+                w, h, x, y = map(int, m.groups())
+                rect = (x, y, w, h)
+        except Exception:
+            log.debug("overlay: xrandr ilegivel; usando a tela X inteira", exc_info=True)
+        _X11_PRIMARY.clear()
+        _X11_PRIMARY[key] = rect
+    return _X11_PRIMARY[key]
 
 
 SPI_GETWORKAREA = 0x0030
@@ -303,6 +335,10 @@ def _x11_workarea_bottom(fallback: int) -> int:
     `0, 0, 1920, 1034` com o painel de 46 px embaixo). Lido pelo `xprop`
     (pacote do Fedora KDE) e guardado por 5 s: o layout chama isto a cada troca
     de modo, e um subprocesso por quadro seria caro.
+
+    A área vem em px LÓGICOS, mas as janelas X vivem em px multiplicados pelo
+    `[Xwayland] Scale` do kwinrc (medido: 1034 com escala 1,35, notebook com a
+    base em 1458). `fallback` é a base do primário e também o teto.
     """
     now = time.monotonic()
     if _X11_WORKAREA["bottom"] is not None and now - _X11_WORKAREA["t"] < 5.0:
@@ -313,11 +349,91 @@ def _x11_workarea_bottom(fallback: int) -> int:
                              text=True, timeout=1.0, check=False).stdout
         nums = [int(x) for x in out.split("=", 1)[1].replace(",", " ").split()[:4]]
         if len(nums) == 4 and nums[3] > 0:
-            bottom = nums[1] + nums[3]
+            k = subprocess.run(["kreadconfig6", "--file", "kwinrc", "--group", "Xwayland",
+                                "--key", "Scale", "--default", "1"], capture_output=True,
+                               text=True, timeout=1.0, check=False).stdout.strip()
+            bottom = min(fallback, int(round((nums[1] + nums[3]) * float(k or 1))))
     except Exception:
         log.debug("overlay: _NET_WORKAREA ilegivel; usando a base da tela", exc_info=True)
     _X11_WORKAREA.update(t=now, bottom=bottom)
     return bottom
+
+
+_XSHAPE: dict = {}
+
+
+def _capsule_rows(w: int, h: int) -> list[tuple[int, int, int, int]]:
+    """Faixas de 1 px de altura (x, y, w, h) que cobrem a cápsula `w`x`h`."""
+    r = h / 2.0
+    rows = []
+    for y in range(h):
+        dy = y + 0.5 - r
+        dx = math.sqrt(max(0.0, r * r - dy * dy))
+        x0, x1 = int(round(r - dx)), int(round(w - r + dx))
+        if x1 > x0:
+            rows.append((x0, y, x1 - x0, 1))
+    return rows
+
+
+def _xlib():
+    """libX11/libXext por ctypes e uma conexão X própria, só da thread Tk. None se faltar."""
+    if "dpy" not in _XSHAPE:
+        _XSHAPE["dpy"] = None            # falhou uma vez, não tenta a cada quadro
+        try:
+            P, U = ctypes.c_void_p, ctypes.c_ulong
+            x11, xext = ctypes.CDLL("libX11.so.6"), ctypes.CDLL("libXext.so.6")
+            x11.XOpenDisplay.restype = P
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XFlush.argtypes = [P]
+            x11.XFree.argtypes = [P]
+            x11.XQueryTree.argtypes = [P, U, ctypes.POINTER(U), ctypes.POINTER(U),
+                                       ctypes.POINTER(P), ctypes.POINTER(ctypes.c_uint)]
+            xext.XShapeCombineRectangles.argtypes = [P, U, ctypes.c_int, ctypes.c_int,
+                                                     ctypes.c_int, P, ctypes.c_int,
+                                                     ctypes.c_int, ctypes.c_int]
+            dpy = x11.XOpenDisplay(None)
+            if dpy:
+                _XSHAPE.update(dpy=dpy, x11=x11, xext=xext)
+        except Exception:
+            log.warning("overlay: sem extensao SHAPE; pilula sai retangular", exc_info=True)
+    return _XSHAPE if _XSHAPE["dpy"] else None
+
+
+def _x11_wrapper(win: int) -> int | None:
+    """O pai do `winfo_id()`: o wrapper do Tk, a janela de topo que o KWin compõe.
+
+    `wm frame` não serve: sem reparent (override-redirect) ele devolve o próprio
+    `winfo_id()` (medido). O wrapper só existe depois do primeiro update_idletasks.
+    """
+    x = _xlib()
+    if x is None:
+        return None
+    root, parent = ctypes.c_ulong(), ctypes.c_ulong()
+    kids, n = ctypes.c_void_p(), ctypes.c_uint()
+    if not x["x11"].XQueryTree(x["dpy"], win, ctypes.byref(root), ctypes.byref(parent),
+                               ctypes.byref(kids), ctypes.byref(n)):
+        return None
+    if kids:
+        x["x11"].XFree(kids)
+    return parent.value or None
+
+
+def _x11_shape_capsule(win: int, w: int, h: int) -> None:
+    """Linux: recorta a janela X no formato da cápsula (extensão SHAPE).
+
+    Sem `-transparentcolor` no X11 o fundo da janela aparecia como cantos
+    pretos em volta da pílula. A máscara é de 1 bit, como o desenho do Tk
+    (que no X11 não tem antialias).
+    """
+    x = _xlib()
+    if x is None:
+        return
+    rows = _capsule_rows(w, h)
+    flat = [v for row in rows for v in row]
+    arr = (ctypes.c_short * len(flat))(*flat)       # XRectangle = 4 shorts
+    # ShapeBounding=0, ShapeSet=0, Unsorted=0
+    x["xext"].XShapeCombineRectangles(x["dpy"], win, 0, 0, 0, arr, len(rows), 0, 0)
+    x["x11"].XFlush(x["dpy"])
 
 
 def _workarea_bottom(fallback: int) -> int:
@@ -477,6 +593,7 @@ class Overlay:
         self._font = None
         self._hwnd = None
         self._key = _KEY      # vira _BG se o -transparentcolor não pegar
+        self._xwin = None     # Linux: janela X de fora do Tk (recebe o recorte SHAPE)
         self._vis = False
         self._frame = 0
         self._lvl = 0.0
@@ -487,6 +604,8 @@ class Overlay:
         self._next_t = 0.0    # prazo do proximo tick (monotonic)
         self._scale = 1.0
         self._dpi = 96
+        self._sx = 0          # origem do monitor primario (0,0 no Windows)
+        self._sy = 0
         self._sw = 1920
         self._sh = 1080
         self._h = _BASE_H
@@ -678,8 +797,8 @@ class Overlay:
                 log.warning("overlay: ex-style 0x%08X difere do medido 0x%08X", got, EX_DOC)
 
             self._dpi = _dpi_primary(hwnd)
-            self._sw, self._sh = _primary_size(root.winfo_screenwidth(),
-                                               root.winfo_screenheight())
+            self._sx, self._sy, self._sw, self._sh = _primary_rect(
+                root.winfo_screenwidth(), root.winfo_screenheight())
             self._tk_metrics(tkfont)
 
             self.alive = True
@@ -723,8 +842,12 @@ class Overlay:
             self._dpi = max(72, int(round(float(root.winfo_fpixels("1i")))))
         except Exception:
             self._dpi = 96
-        self._sw, self._sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        log.info("overlay x11 (XWayland) dpi=%s screen=%sx%s", self._dpi, self._sw, self._sh)
+        self._sx, self._sy, self._sw, self._sh = _primary_rect(
+            root.winfo_screenwidth(), root.winfo_screenheight())
+        self._xwin = _x11_wrapper(root.winfo_id())
+        log.info("overlay x11 (XWayland) dpi=%s primario=%sx%s+%s+%s wrapper=%s",
+                 self._dpi, self._sw, self._sh, self._sx, self._sy,
+                 hex(self._xwin) if self._xwin else None)
         self._tk_metrics(tkfont)
         self.alive = True
         self._ready.set()
@@ -831,6 +954,9 @@ class Overlay:
         # retângulo. A borda é uma cápsula clara com outra escura por cima.
         # Ociosa: um traço cinza chapado, sem contorno, como a Flow Bar.
         edge, fill = (_IDLE, _IDLE) if mode == "idle" else (_EDGE, _BG)
+        if self._xwin:
+            # Pixel que sobrar dentro do recorte SHAPE vira contorno, nao preto.
+            cv.configure(bg=edge)
         b = 0 if mode == "idle" else max(1, int(round(1.5 * s)))
         cv.create_oval(0, 0, H, H, fill=edge, outline="")
         cv.create_oval(W - H, 0, W, H, fill=edge, outline="")
@@ -871,11 +997,13 @@ class Overlay:
             off = int(round(float(self.cfg.get("overlay_offset_y", 8)) * s))
         except Exception:
             off = int(round(8 * s))
-        x = max(0, (self._sw - W) // 2)
+        x = self._sx + max(0, (self._sw - W) // 2)
         # Ancorada na barra de tarefas (area de trabalho), nao na base da tela.
-        y = max(0, _workarea_bottom(self._sh) - H - off)
+        y = max(0, _workarea_bottom(self._sy + self._sh) - H - off)
         self._geom = (x, y, W, H)
         self._root.geometry("%dx%d+%d+%d" % (W, H, x, y))
+        if self._xwin:
+            _x11_shape_capsule(self._xwin, W, H)
         # `wm geometry` do Tk só vira MoveWindow no próximo idle. Como estamos
         # dentro de um callback de `after`, sem forçar aqui o ShowWindow logo
         # abaixo revelaria a pílula no tamanho e na posição antigos por um frame.
@@ -894,17 +1022,17 @@ class Overlay:
     def _tk_check_screen(self) -> None:
         """Resolução ou DPI mudaram (dock, projetor, troca de escala)? Refaz."""
         try:
-            sw, sh = _primary_size(self._root.winfo_screenwidth(),
-                                   self._root.winfo_screenheight())
+            sx, sy, sw, sh = _primary_rect(self._root.winfo_screenwidth(),
+                                           self._root.winfo_screenheight())
             dpi = _dpi_primary(self._hwnd) if _WIN else self._dpi
         except Exception:
             log.debug("overlay: leitura de tela falhou", exc_info=True)
             return
-        if (sw, sh) == (self._sw, self._sh) and dpi == self._dpi:
+        if (sx, sy, sw, sh) == (self._sx, self._sy, self._sw, self._sh) and dpi == self._dpi:
             return
-        log.info("overlay: tela mudou %sx%s@%s -> %sx%s@%s",
-                 self._sw, self._sh, self._dpi, sw, sh, dpi)
-        self._sw, self._sh, self._dpi = sw, sh, dpi
+        log.info("overlay: tela mudou %sx%s+%s+%s@%s -> %sx%s+%s+%s@%s",
+                 self._sw, self._sh, self._sx, self._sy, self._dpi, sw, sh, sx, sy, dpi)
+        self._sx, self._sy, self._sw, self._sh, self._dpi = sx, sy, sw, sh, dpi
         # _tk_metrics zera o _lay_key, então o próximo tick refaz o desenho e a
         # geometria já com a tela nova.
         self._tk_metrics()
@@ -949,7 +1077,7 @@ class Overlay:
         f0, direction = self._slide
         x, y, w, h = self._geom
         t = min(1.0, (time.monotonic() - f0) / _SLIDE_S)
-        below = max(0, self._sh - y)              # distância até sumir sob a base da tela
+        below = max(0, self._sy + self._sh - y)   # distância até sumir sob a base do primário
         if direction > 0:
             dy = below * (1.0 - t) ** 3           # entrando: rápido, depois freia
         else:
