@@ -1,0 +1,62 @@
+# wisper -- dependencias no Linux (Fedora 44 KDE Plasma 6, Wayland, PipeWire).
+#
+# Notebook i5-13420H, Intel UHD, SEM GPU NVIDIA: o faster-whisper roda na CPU
+# em int8 com o modelo `small`. Nada de wheels da CUDA aqui (nvidia-cublas-cu12,
+# nvidia-cudnn-cu12), nem do COM do Windows (comtypes, pycaw).
+#
+# Instale sempre por:  ./scripts/setup.sh
+#
+# O venv e criado com --system-site-packages DE PROPOSITO: a bandeja (pystray)
+# fala StatusNotifierItem pelo backend AppIndicator, que precisa do `gi`
+# (PyGObject) do sistema. Compilar PyGObject pelo pip exige gcc, cairo-devel e
+# gobject-introspection-devel; o do Fedora ja vem instalado no Plasma.
+# Pacotes do venv continuam tendo precedencia sobre os do sistema.
+#
+# Pacotes de SISTEMA (dnf, nao pip) -- o setup.sh confere com `rpm -q`:
+#   portaudio      : libportaudio.so.2, que o sounddevice carrega por ctypes
+#   wl-clipboard   : wl-copy / wl-paste, a entrega do texto no Wayland
+#   python3-tkinter: so a pilula (overlay); sem ele o app roda sem pilula
+#   libappindicator-gtk3: o typelib AppIndicator3 da bandeja
+# Ver docs/LINUX.md.
+
+# --- STT local (faster-whisper na CPU) ---
+# Mesmo par validado do Windows. Os wheels manylinux de cp314 existem para os dois.
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+
+# --- captura de audio ---
+# O sounddevice do Linux NAO embute o PortAudio: usa o libportaudio do sistema
+# (pacote `portaudio`), que no Fedora fala com o PipeWire pelo plugin ALSA
+# (`pipewire-alsa`, device "pipewire"/"default").
+sounddevice==0.5.6
+soxr==1.1.0
+
+# --- DSP ---
+numpy>=1.26,<3
+scipy>=1.11
+
+# --- D-Bus (atalho global pelo kglobalaccel do KDE) ---
+# Python puro, sem GLib e sem compilar: cada thread abre a propria conexao
+# bloqueante. Ver wispr/hotkey_linux.py.
+jeepney>=0.8
+
+# --- bandeja ---
+pystray==0.19.5
+Pillow>=10
+
+# --- wav dos fixtures / keep_recordings ---
+soundfile==0.14.0
+
+# --- suite offline ---
+# No Windows a suite roda por unittest (tests/run_all.ps1); no Linux, pelo
+# pytest (tests/run_all.sh), que descobre os mesmos unittest.TestCase.
+pytest>=8
+
+# --- deliberadamente AUSENTE (diferente do requirements.txt) ---
+# comtypes / pycaw         : COM do Windows (IMMDeviceEnumerator).
+# nvidia-*-cu12            : nao ha GPU NVIDIA neste notebook.
+# webrtcvad-wheels         : reserva nao importada por ninguem; fica de fora ate
+#                            alguem precisar dela.
+# dbus-python / PyQt       : jeepney cobre o D-Bus sem compilar nada.
+# evdev / python-uinput    : o /dev/uinput e escrito por ioctl puro em
+#                            wispr/inject_linux.py, sem dependencia extra.

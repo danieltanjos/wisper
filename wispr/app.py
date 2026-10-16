@@ -130,9 +130,20 @@ _MODES_DEGRADED = (_MODE_CLIPBOARD, _MODE_PARTIAL)
 # ---------------------------------------------------------------------------
 # Win32: instancia unica e deteccao de janela elevada
 # ---------------------------------------------------------------------------
-_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_u32 = ctypes.WinDLL("user32", use_last_error=True)
-_adv = ctypes.WinDLL("advapi32", use_last_error=True)
+_WIN = sys.platform == "win32"
+
+
+def _win_dll(name: str):
+    # Fora do Windows: um objeto que aceita os argtypes/restype abaixo e estoura
+    # se alguem CHAMAR (wispr/win32stub.py). Nenhum caminho Linux chama:
+    # `process_is_elevated`, `foreground_is_elevated` e o mutex tem ramo proprio.
+    from wispr import win32stub
+    return win32stub.dll(name)
+
+
+_k32 = _win_dll("kernel32")
+_u32 = _win_dll("user32")
+_adv = _win_dll("advapi32")
 
 # restype explicito e obrigatorio: sem isso o ctypes assume c_int e HANDLE de 64
 # bits volta truncado. O mesmo bug que fazia SetWindowsHookExW falhar com 126.
@@ -209,6 +220,8 @@ def _own_integrity_level() -> int | None:
 
 
 def process_is_elevated() -> bool:
+    if not _WIN:
+        return False      # no Linux nao existe UIPI para o "elevado" importar
     lvl = _own_integrity_level()
     return lvl is not None and lvl >= SECURITY_MANDATORY_HIGH_RID
 
@@ -220,6 +233,10 @@ def foreground_is_elevated() -> bool:
     silencio, com GetLastError() == 0 -- nao existe jeito de perceber depois.
     Entao a checagem tem que vir antes de injetar. Ver ARCHITECTURE.md secao 5.
     """
+    if not _WIN:
+        # Wayland nao tem UIPI: o compositor entrega a colagem a qualquer janela,
+        # inclusive a de um processo de root.
+        return False
     try:
         hwnd = _u32.GetForegroundWindow()
         if not hwnd:
@@ -593,6 +610,8 @@ class App:
         o shutdown roda numa thread da bandeja. Sem posse nao ha o que liberar:
         basta o CloseHandle.
         """
+        if not _WIN:
+            return self._acquire_lockfile()
         try:
             handle = _k32.CreateMutexW(None, False, config.MUTEX_NAME)
             err = ctypes.get_last_error()
@@ -608,6 +627,38 @@ class App:
             self._mutex = handle
             return True
         except Exception:
+            self.log.exception("single-instance check failed; continuing")
+            return True
+
+    def _acquire_lockfile(self) -> bool:
+        """Instancia unica no Linux: `flock` exclusivo em config.LOCK_PATH.
+
+        O kernel solta o lock quando o processo morre de qualquer jeito (ate'
+        `kill -9`), entao nao existe lock "velho" para limpar. O guardiao dos
+        atalhos (wispr/linux/keyguard.py) le esse mesmo lock para saber se uma
+        instancia nova ja subiu.
+        """
+        import fcntl
+        fd = None
+        try:
+            path = config.LOCK_PATH
+            fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self.log.warning("another instance already holds %s; exiting quietly", path)
+                os.close(fd)
+                return False
+            os.ftruncate(fd, 0)
+            os.write(fd, str(os.getpid()).encode())
+            self._mutex = _LockFile(fd)
+            return True
+        except Exception:
+            if fd is not None and self._mutex is None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             self.log.exception("single-instance check failed; continuing")
             return True
 
@@ -1920,7 +1971,7 @@ class App:
         try:
             if not config.CONFIG_PATH.exists():
                 config.save(self.cfg)
-            os.startfile(str(config.CONFIG_PATH))   # noqa: S606 - acao pedida pelo usuario
+            _open_path(config.CONFIG_PATH)
             self.log.info("opened %s", config.CONFIG_PATH)
         except Exception:
             self.log.exception("failed to open config")
@@ -1929,7 +1980,7 @@ class App:
     def open_logs(self) -> None:
         try:
             config.LOG_DIR.mkdir(parents=True, exist_ok=True)
-            os.startfile(str(config.LOG_DIR))       # noqa: S606 - acao pedida pelo usuario
+            _open_path(config.LOG_DIR)
             self.log.info("opened %s", config.LOG_DIR)
         except Exception:
             self.log.exception("failed to open logs folder")
@@ -2002,7 +2053,9 @@ class App:
                 log.exception("error stopping %s", what)
 
         handle, self._mutex = self._mutex, None
-        if handle:
+        if isinstance(handle, _LockFile):
+            handle.close()
+        elif handle:
             try:
                 # So CloseHandle: o mutex e' criado sem posse (bInitialOwner=False),
                 # entao nao ha nada a liberar -- e um ReleaseMutex daqui falharia
@@ -2042,6 +2095,38 @@ class App:
         thread.join(PRELOAD_JOIN_S)
         if thread.is_alive():
             self.log.warning("preload still loading at shutdown; it closes its own engine")
+
+
+class _LockFile:
+    """O fd do `flock` da instancia unica no Linux; `close()` solta o lock."""
+
+    def __init__(self, fd: int):
+        self.fd = fd
+
+    def close(self) -> None:
+        fd, self.fd = self.fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __bool__(self) -> bool:
+        return self.fd is not None
+
+
+def _open_path(path) -> None:
+    """Abre arquivo/pasta no programa padrao. Acao pedida pelo usuario no menu."""
+    if _WIN:
+        os.startfile(str(path))   # noqa: S606 - acao pedida pelo usuario
+        return
+    import subprocess
+    # Popen sem esperar: o xdg-open pode ficar vivo enquanto o editor roda, e
+    # quem chama e' a thread da bandeja. start_new_session para o editor nao
+    # morrer junto com o wisper.
+    subprocess.Popen(["xdg-open", str(path)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
 
 
 def _one_line(text, limit: int = MSG_MAX_CHARS) -> str:

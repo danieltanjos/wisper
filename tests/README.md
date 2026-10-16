@@ -16,6 +16,18 @@ Sem PowerShell:
 python -m unittest discover -s tests -t tests -v
 ```
 
+No Linux (docs/LINUX.md), pelo pytest, que descobre os mesmos `unittest.TestCase`:
+
+```bash
+./tests/run_all.sh                 # tudo (= .venv/bin/python -m pytest -q -p no:cacheprovider tests)
+./tests/run_all.sh -k Linux        # filtro do pytest
+./tests/run_all.sh tests/test_dsp.py
+```
+
+Os testes que exercitam a camada Win32 por dentro (struct do hook, `SendInput`, token de
+integridade, `%PATH%`) pulam fora do Windows com o motivo escrito; o equivalente Linux está em
+`test_linux.py`.
+
 ## O que a suíte garantidamente NÃO faz
 
 | proibido | como isso é garantido |
@@ -27,6 +39,7 @@ python -m unittest discover -s tests -t tests -v
 | ler ou escrever o clipboard | idem para `OpenClipboard`, `SetClipboardData`, `EmptyClipboard`, `GetClipboardData`, `EnumClipboardFormats` |
 | abrir janela, tray ou caixa de mensagem | `tkinter`, `pystray` e `PIL` são stubs; `CreateWindowExW` e `MessageBoxW` estão bloqueados |
 | apitar no fone | `winsound` é stub: `PlaySound`/`Beep` abrem endpoint de saída e o ping do app sairia alto no meio da partida |
+| **Linux:** registrar atalho global, injetar tecla, mexer no clipboard | `block_linux()`: conectar em socket AF_UNIX do usuário (`/run/user/<uid>/bus`, `wayland-0`, PipeWire) vira `RuntimeError`; `subprocess` de `wl-copy`, `wl-paste`, `xdg-open`, `ydotool`, `wtype`, `gdbus`... e do guardião de atalhos também; abrir `/dev/uinput` idem. `gi` (GTK) é stub |
 | baixar qualquer coisa | nenhum teste chama `Engine.transcribe()`, que é o único caminho de rede (o `wispr/stt.py` usa `urllib.request`, não `requests` — o stub de `requests` é cinto e suspensórios) |
 | escrever no projeto | tudo que grava arquivo usa `tempfile.mkdtemp()`; até o `ensure_dirs()` é redirecionado |
 
@@ -60,6 +73,7 @@ nenhum teste chega perto disso.
 | `test_dsp.py` | `to_whisper()` em sinais sintéticos: 48k→16k, silêncio puro **não** amplificado, pico em -3 dBFS, passa-alta de 80 Hz matando 40 Hz e preservando 1 kHz |
 | `test_ring.py` | a aritmética do ring buffer do microfone: pré-roll, virada do buffer, detecção de `lapped` e a faixa de guarda de um bloco |
 | `test_regressions.py` | as cinco falhas achadas na auditoria, que **nenhum** dos arquivos acima pegava (detalhe abaixo) |
+| `test_linux.py` | o port Linux: paridade do `Delivery`/`sanitize` com o Windows (pelo fonte), códigos Qt do kglobalaccel, as duas flags virando registro/soltura de Return/Escape, o guardião, o protocolo do `fake_input` inteiro contra um compositor falso num socket temporário, a entrega por clipboard + Shift+Insert, a escolha do device PipeWire, CPU que não carrega caindo no Groq, `flock` de instância única. Cada caso remutado em memória (8 mutantes, todos vermelhos) |
 
 Em `test_ring.py` cada família de casos roda duas vezes, contra a réplica `FakeRing` e contra o
 `Mic` de verdade criado com `object.__new__`. São duas famílias porque o `take()` reserva uma faixa

@@ -12,6 +12,7 @@ import copy
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,20 @@ os.environ.setdefault("HF_HOME", str(MODELS_DIR))
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 MUTEX_NAME = "Local\\WisprCloneDaniel"
+
+IS_WINDOWS = sys.platform == "win32"
+
+
+def _lock_path() -> Path:
+    """Instancia unica no Linux: `flock` num arquivo em XDG_RUNTIME_DIR (tmpfs
+    por usuario, some no logout). O equivalente do MUTEX_NAME acima."""
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    if rt and os.path.isdir(rt):
+        return Path(rt) / "wisper.lock"
+    return LOG_DIR / "wisper.lock"
+
+
+LOCK_PATH = _lock_path()
 
 
 def load_dotenv(path: Path | None = None) -> int:
@@ -154,7 +169,37 @@ DEFAULTS = {
     "log_level": "INFO",
     "keep_recordings": False,       # grava o wav de cada ditado em logs/recordings
     "history_size": 50,
+
+    # --- so no Linux (o Windows ignora). Ver docs/LINUX.md ---
+    # Atalho de colar enviado pelo fake_input do KWin. Shift+Insert e nao Ctrl+V:
+    # no Konsole Ctrl+V nao cola. Teclas validas: wispr/linux/wayland.KEYCODES.
+    "linux_paste_keys": "shift+insert",
+    # Tambem poe o texto na selecao PRIMARY: Alacritty/xterm/foot colam a
+    # primary no Shift+Insert.
+    "linux_paste_primary": True,
+    # Trecho do nome do device do PortAudio (sd.query_devices()). Vazio = o
+    # device "pipewire" do ALSA, que segue a fonte padrao do PipeWire (a que o
+    # usuario escolhe no Plasma).
+    "linux_mic_device": "",
 }
+
+# Notebook sem GPU NVIDIA (i5-13420H, Intel UHD): no Linux o padrao e' CPU int8
+# com o `small`, que baixa sozinho no primeiro uso para models/. O turbo na CPU
+# custa 6,5-8 s FIXOS por ditado neste notebook (medido no Windows, CLAUDE.md);
+# o small, ~2,4 s, ao preco de WER bem pior (38%). `"engine": "groq"` no
+# config.json da ~0,5 s. O Windows continua com o turbo na GPU.
+LINUX_DEFAULTS = {
+    "model_id": "Systran/faster-whisper-small",
+    "device": "cpu",
+    "compute_type": "int8",
+    "cpu_compute_type": "int8",
+    # O app em foco le a selecao do Wayland de forma assincrona, depois da
+    # tecla de colar: restaurar cedo demais cancela a transferencia.
+    "clipboard_restore_delay": 0.5,
+}
+
+if not IS_WINDOWS:
+    DEFAULTS.update(LINUX_DEFAULTS)
 
 
 class Config(dict):

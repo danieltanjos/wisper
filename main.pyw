@@ -9,6 +9,7 @@ MessageBoxW. Sem isso, "o programa simplesmente nao abre" e o usuario nao tem
 uma unica pista do motivo.
 
 Uso:  pythonw.exe main.pyw     (ou python.exe main.pyw para ver o console)
+Linux: .venv/bin/wisper main.pyw   (ver scripts/run.sh e docs/LINUX.md)
 """
 from __future__ import annotations
 
@@ -85,6 +86,16 @@ def _mirror_to_log(text: str) -> None:
 
 def _message_box(text: str) -> None:
     """Ultimo recurso. Se nem o arquivo deu para escrever, ao menos aparece algo."""
+    if sys.platform != "win32":
+        # Linux: notificacao do Plasma. Lancado pelo menu ou pelo autostart nao
+        # existe terminal, e este e' o unico aviso que o usuario chega a ver.
+        try:
+            import subprocess
+            subprocess.run(["notify-send", "-u", "critical", "-a", "wisper", _TITLE,
+                            text[-600:]], timeout=5, check=False)
+        except Exception:
+            pass
+        return
     try:
         import ctypes
         from ctypes import wintypes

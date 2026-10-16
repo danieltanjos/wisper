@@ -17,6 +17,17 @@ nunca é exibida com `deiconify()`: ela nasce `withdraw()` e só aparece via
 Ver docs/ARCHITECTURE.md seção 6.
 
 Os sons moram aqui porque são feedback de UI, não áudio de captura.
+
+Linux (KDE Plasma 6, Wayland): o mesmo arquivo, com ramos `_WIN`. O Tk roda no
+XWayland; uma janela `overrideredirect` do X11 não é gerenciada pelo KWin e
+**nunca recebe foco** (não existe NOACTIVATE para pedir: ela simplesmente não
+entra na política de foco), então o ex-style vira desnecessário. Mostrar e
+esconder é `deiconify()`/`withdraw()` do próprio Tk — que aqui NÃO ativa nada,
+ao contrário do Windows. A posição usa a área de trabalho do `_NET_WORKAREA`
+(o KWin publica para o XWayland), para a pílula ficar acima do painel. Não há
+`-transparentcolor` no X11: a pílula sai num retângulo preto (o fundo da
+própria cápsula). Precisa do pacote `python3-tkinter`; sem ele o app segue
+sem pílula, como sempre. Ver docs/LINUX.md.
 """
 from __future__ import annotations
 
@@ -28,11 +39,18 @@ import logging
 import math
 import queue
 import threading
+import subprocess
+import sys
 import time
 import wave
-import winsound
+
+try:
+    import winsound
+except ImportError:          # Linux: sem bipes por enquanto (`sounds` e' False por padrao)
+    winsound = None
 
 from wispr import config
+from wispr import win32stub
 
 try:  # logging_setup é de outro módulo; a ausência dele não pode derrubar nada
     from wispr import logging_setup as _logging_setup
@@ -48,7 +66,10 @@ __all__ = ["Overlay", "ping_start", "ping_stop"]
 # use_last_error=True guarda o GetLastError num slot do ctypes, que não é
 # embaralhado pelas chamadas Win32 que o próprio ctypes faz entre a chamada e a
 # leitura. Sem isso o código de erro lido é lixo.
-_u32 = ctypes.WinDLL("user32", use_last_error=True)
+_WIN = sys.platform == "win32"
+# Fora do Windows: aceita os argtypes/restype abaixo e estoura se for CHAMADO;
+# toda chamada Win32 deste arquivo ja vive dentro de try/except ou atras de _WIN.
+_u32 = win32stub.dll("user32")
 
 GWL_EXSTYLE = -20
 WS_EX_TOPMOST = 0x00000008
@@ -257,6 +278,8 @@ def _dpi_primary(hwnd=None) -> int:
 
 def _primary_size(fallback_w: int, fallback_h: int) -> tuple[int, int]:
     """Tamanho do monitor PRIMÁRIO em pixels físicos (já somos DPI-aware)."""
+    if not _WIN:
+        return fallback_w, fallback_h    # o Tk/XWayland já dá o tamanho da tela
     try:
         w = int(_u32.GetSystemMetrics(SM_CXSCREEN))
         h = int(_u32.GetSystemMetrics(SM_CYSCREEN))
@@ -270,12 +293,41 @@ def _primary_size(fallback_w: int, fallback_h: int) -> tuple[int, int]:
 SPI_GETWORKAREA = 0x0030
 
 
+_X11_WORKAREA = {"t": 0.0, "bottom": None}
+
+
+def _x11_workarea_bottom(fallback: int) -> int:
+    """Linux: base da área de trabalho pelo `_NET_WORKAREA` do X root.
+
+    O KWin publica a área livre de painéis para os clientes XWayland (medido:
+    `0, 0, 1920, 1034` com o painel de 46 px embaixo). Lido pelo `xprop`
+    (pacote do Fedora KDE) e guardado por 5 s: o layout chama isto a cada troca
+    de modo, e um subprocesso por quadro seria caro.
+    """
+    now = time.monotonic()
+    if _X11_WORKAREA["bottom"] is not None and now - _X11_WORKAREA["t"] < 5.0:
+        return _X11_WORKAREA["bottom"]
+    bottom = fallback
+    try:
+        out = subprocess.run(["xprop", "-root", "_NET_WORKAREA"], capture_output=True,
+                             text=True, timeout=1.0, check=False).stdout
+        nums = [int(x) for x in out.split("=", 1)[1].replace(",", " ").split()[:4]]
+        if len(nums) == 4 and nums[3] > 0:
+            bottom = nums[1] + nums[3]
+    except Exception:
+        log.debug("overlay: _NET_WORKAREA ilegivel; usando a base da tela", exc_info=True)
+    _X11_WORKAREA.update(t=now, bottom=bottom)
+    return bottom
+
+
 def _workarea_bottom(fallback: int) -> int:
     """Borda de cima da barra de tarefas do monitor primário, em px físicos.
 
     A pílula fica ancorada nela, e não na base da tela: assim "um pouquinho
     acima da barra" vale com a barra de qualquer altura ou escondida.
     """
+    if not _WIN:
+        return _x11_workarea_bottom(fallback)
     try:
         rc = wt.RECT()
         if _u32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rc), 0) and rc.bottom > 0:
@@ -539,6 +591,16 @@ class Overlay:
 
     def _hide_now(self) -> None:
         """Esconde pelo Win32. Nunca levanta."""
+        if not _WIN:
+            # Tk nao e' thread-safe e no X11 nao ha ShowWindow assincrono: so a
+            # thread Tk esconde. O stop() de outra thread (Tk travado) desiste.
+            try:
+                if self._root is not None and threading.current_thread() is self._thread:
+                    self._root.withdraw()
+            except Exception:
+                log.debug("overlay: withdraw falhou", exc_info=True)
+            self._vis = False
+            return
         try:
             hwnd = self._hwnd
             if hwnd:
@@ -587,6 +649,9 @@ class Overlay:
             # O wrapper Win32 do Tk só existe depois disto; sem o update_idletasks
             # o winfo_id() ainda não tem pai e o ex-style iria para a janela errada.
             root.update_idletasks()
+            if not _WIN:
+                self._tk_main_x11(root, tkfont)
+                return
             hwnd = _toplevel_hwnd(root.winfo_id())
             self._hwnd = hwnd
 
@@ -644,6 +709,29 @@ class Overlay:
                 except Exception:
                     log.debug("overlay: destroy no shutdown falhou", exc_info=True)
             self._hwnd = None
+
+    def _tk_main_x11(self, root, tkfont) -> None:
+        """Linux: o resto do `_tk_main` sem ex-style nem HWND. Roda o mainloop.
+
+        Override-redirect no XWayland: o KWin nao gerencia a janela, ela nao
+        entra no Alt+Tab, nao tem decoracao e nao recebe foco. `-topmost`
+        reforca o empilhamento por cima do painel.
+        """
+        try:
+            # tk scaling = pixels por ponto; 96 dpi = 1.333. O XWayland do KDE
+            # reflete a escala configurada no Xft.dpi.
+            self._dpi = max(72, int(round(float(root.winfo_fpixels("1i")))))
+        except Exception:
+            self._dpi = 96
+        self._sw, self._sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        log.info("overlay x11 (XWayland) dpi=%s screen=%sx%s", self._dpi, self._sw, self._sh)
+        self._tk_metrics(tkfont)
+        self.alive = True
+        self._ready.set()
+        self._next_t = time.monotonic()
+        root.after(_TICK_MS, self._tk_tick)
+        root.mainloop()
+        log.info("overlay mainloop encerrado")
 
     def _tk_metrics(self, tkfont=None) -> None:
         """Recalcula tudo que depende da escala de DPI. Só na thread Tk."""
@@ -808,7 +896,7 @@ class Overlay:
         try:
             sw, sh = _primary_size(self._root.winfo_screenwidth(),
                                    self._root.winfo_screenheight())
-            dpi = _dpi_primary(self._hwnd)
+            dpi = _dpi_primary(self._hwnd) if _WIN else self._dpi
         except Exception:
             log.debug("overlay: leitura de tela falhou", exc_info=True)
             return
@@ -822,6 +910,20 @@ class Overlay:
         self._tk_metrics()
 
     def _tk_reveal(self) -> None:
+        if not _WIN:
+            # No X11 o deiconify de uma janela override-redirect so' a mapeia:
+            # nao ativa e nao rouba foco (quem dá foco é o KWin, e ele nao
+            # gerencia esta janela).
+            g = self._geom
+            if g:
+                x, y, w, h = g
+                if self._slide is not None:
+                    y = self._slide_y()[0]
+                self._root.geometry("%dx%d+%d+%d" % (w, h, x, int(round(y))))
+            self._root.deiconify()
+            self._root.lift()
+            self._vis = True
+            return
         hwnd = self._hwnd
         if not hwnd:
             return
@@ -855,6 +957,11 @@ class Overlay:
         return y + dy, t >= 1.0
 
     def _tk_move(self, y: float) -> None:
+        if not _WIN:
+            if self._geom:
+                x, _y, w, h = self._geom
+                self._root.geometry("%dx%d+%d+%d" % (w, h, x, int(round(y))))
+            return
         hwnd = self._hwnd
         if not hwnd or not self._geom:
             return

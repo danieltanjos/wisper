@@ -17,6 +17,13 @@ Duas garantias, nessa ordem:
    Atribuir `.argtypes`/`.restype` continua funcionando, porque isso e feito no
    nivel do modulo e nao chega a chamar nada.
 
+3. No Linux (docs/LINUX.md) o perigo mora em outro lugar, e a trava tambem:
+   conectar no D-Bus de sessao (registraria Meta+A/Return/Escape no
+   kglobalaccel e roubaria a tecla de verdade), conectar no socket do Wayland
+   (o fake_input injeta tecla), rodar wl-copy/wl-paste (clipboard), xdg-open,
+   ydotool/wtype, o guardiao de atalhos, e abrir /dev/uinput. Tudo isso vira
+   RuntimeError. `block_linux()` e' inofensivo no Windows.
+
 Ver docs/ARCHITECTURE.md secoes 3, 4 e 5.
 """
 from __future__ import annotations
@@ -25,6 +32,8 @@ import ctypes
 import importlib
 import logging
 import os
+import socket
+import subprocess
 import sys
 import types
 
@@ -139,6 +148,8 @@ HEAVY = (
     # UI
     "tkinter", "tkinter.ttk", "tkinter.font", "tkinter.messagebox",
     "pystray", "PIL", "PIL.Image", "PIL.ImageDraw", "PIL.ImageFont",
+    # GTK/GObject (a bandeja do Linux sobe o loop do GTK no import do pystray)
+    "gi", "gi.repository",
     # injecao de teclado de terceiros
     "keyboard", "pyautogui", "pyperclip",
     "win32api", "win32con", "win32gui", "win32clipboard",
@@ -146,7 +157,7 @@ HEAVY = (
     "requests",
 )
 
-_PACKAGES = {"pycaw", "PIL", "tkinter"}
+_PACKAGES = {"pycaw", "PIL", "tkinter", "gi"}
 
 stubbed: list[str] = []
 
@@ -248,7 +259,83 @@ def block_win32() -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# 3. utilitarios para os testes
+# 3. trava do Linux: D-Bus, Wayland, clipboard e uinput
+# --------------------------------------------------------------------------- #
+
+#: Executaveis que nenhum teste pode lancar: mexem no clipboard, injetam tecla,
+#: abrem janela ou registram atalho global.
+BLOCKED_EXES = frozenset({
+    "wl-copy", "wl-paste", "xdg-open", "ydotool", "ydotoold", "wtype", "xdotool",
+    "kwriteconfig6", "kbuildsycoca6", "notify-send", "gdbus", "dbus-send",
+    "qdbus", "qdbus6", "busctl", "pactl", "pw-record", "arecord",
+})
+
+_linux_blocked = False
+
+
+def _unix_target_is_live(addr) -> bool:
+    """Socket AF_UNIX do usuario: barramento de sessao, Wayland, PipeWire..."""
+    if isinstance(addr, (bytes, bytearray)):
+        addr = bytes(addr).decode("utf-8", "replace")
+    if not isinstance(addr, str):
+        return False
+    if addr.startswith("\0"):
+        return True                      # socket abstrato (D-Bus antigo)
+    rt = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/"
+    return addr.startswith(rt) or addr.startswith("/run/user/") or \
+        addr.startswith("/tmp/.X11-unix") or addr.startswith("/var/run/dbus")
+
+
+def block_linux() -> bool:
+    """Idempotente. Bloqueia, no nivel da stdlib, tudo do Linux que encosta no
+    desktop do usuario. Fica ligado no Windows tambem: la nada disso acontece."""
+    global _linux_blocked
+    if _linux_blocked:
+        return True
+
+    orig_connect = socket.socket.connect
+    orig_connect_ex = socket.socket.connect_ex
+
+    def guarded_connect(self, addr, _orig=orig_connect):
+        if getattr(self, "family", None) == socket.AF_UNIX and _unix_target_is_live(addr):
+            raise RuntimeError("wisper tests: conexao AF_UNIX para %r bloqueada (D-Bus / "
+                               "Wayland / PipeWire do usuario)" % (addr,))
+        return _orig(self, addr)
+
+    def guarded_connect_ex(self, addr, _orig=orig_connect_ex):
+        if getattr(self, "family", None) == socket.AF_UNIX and _unix_target_is_live(addr):
+            raise RuntimeError("wisper tests: conexao AF_UNIX para %r bloqueada" % (addr,))
+        return _orig(self, addr)
+
+    socket.socket.connect = guarded_connect
+    socket.socket.connect_ex = guarded_connect_ex
+
+    orig_popen_init = subprocess.Popen.__init__
+
+    def guarded_popen(self, args, *a, _orig=orig_popen_init, **k):
+        argv = [args] if isinstance(args, (str, bytes)) else list(args or ())
+        words = [os.path.basename(str(x)) for x in argv]
+        if (words and words[0] in BLOCKED_EXES) or any("keyguard" in str(x) for x in argv):
+            raise RuntimeError("wisper tests: subprocess %r bloqueado (clipboard, tecla, "
+                               "janela ou atalho global)" % (argv[:3],))
+        return _orig(self, args, *a, **k)
+
+    subprocess.Popen.__init__ = guarded_popen
+
+    orig_os_open = os.open
+
+    def guarded_os_open(path, *a, _orig=orig_os_open, **k):
+        if str(path).startswith(("/dev/uinput", "/dev/input")):
+            raise RuntimeError("wisper tests: abrir %s bloqueado" % path)
+        return _orig(path, *a, **k)
+
+    os.open = guarded_os_open
+    _linux_blocked = True
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# 4. utilitarios para os testes
 # --------------------------------------------------------------------------- #
 
 def load_pure(modname: str):
@@ -261,6 +348,7 @@ def load_pure(modname: str):
     """
     install_stubs()
     block_win32()
+    block_linux()
     try:
         return importlib.import_module(modname), None
     except Exception as exc:  # noqa: BLE001 - e exatamente o que queremos aqui
@@ -322,4 +410,5 @@ def quiet_logging() -> None:
 # Efeito colateral no import, de proposito: quem importar _safety ja esta seguro.
 install_stubs()
 block_win32()
+block_linux()
 quiet_logging()

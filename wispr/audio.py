@@ -9,6 +9,12 @@ Exige interpretador do python.org. O build da Microsoft Store tem identidade de
 pacote com entrada propria no ConsentStore do microfone: em "Prompt" o
 `InputStream()` trava para sempre sem excecao, em "Deny" falha -9999/-9996.
 Ver docs/ARCHITECTURE.md secao 4 — tudo aqui foi medido nesta maquina.
+
+Linux (PipeWire): nao ha COM nem WASAPI. O PortAudio do Fedora fala ALSA, e o
+plugin `pipewire-alsa` expoe o device "pipewire", que segue a fonte padrao do
+PipeWire (a que o usuario escolhe no Plasma) e reamostra para os 48 kHz pedidos.
+Troca de headset e' resolvida pelo proprio PipeWire, sem notificacao nossa; o
+supervisor de stream continua valendo. Ver `pick_linux_device()` e docs/LINUX.md.
 """
 from __future__ import annotations
 
@@ -453,7 +459,51 @@ def _wasapi_hostapi() -> int:
     raise RuntimeError("host API 'Windows WASAPI' nao existe neste PortAudio")
 
 
-def resolve_device(timeout: float = -1.0):
+def pick_linux_device(devices, want: str = ""):
+    """Escolhe o device de captura no Linux. Pura: recebe `sd.query_devices()`.
+
+    Ordem: o trecho de nome do `linux_mic_device` (se houver), depois "pipewire",
+    "default" e "pulse" do ALSA — os tres passam pelo PipeWire e seguem a fonte
+    padrao do usuario —, e por ultimo o primeiro device com entrada. Nunca um
+    `hw:` cru por escolha propria: ele trava o hardware so para nos e ignora a
+    escolha de microfone do Plasma.
+
+    Devolve (indice, nome, fallback), fallback True quando o pedido nao casou.
+    """
+    inputs = [(i, d) for i, d in enumerate(devices)
+              if int(d.get("max_input_channels", 0) or 0) > 0 and d.get("name")]
+    want = (want or "").strip().lower()
+    if want:
+        for i, d in inputs:
+            if want in str(d["name"]).lower():
+                return i, str(d["name"]), False
+    for name in ("pipewire", "default", "pulse"):
+        for i, d in inputs:
+            if str(d["name"]) == name:
+                return i, name, bool(want)
+    if inputs:
+        i, d = inputs[0]
+        return i, str(d["name"]), True
+    raise RuntimeError("nenhum dispositivo de entrada no PortAudio")
+
+
+def _resolve_linux(cfg=None):
+    # Sem cfg explicito vale o do Mic vivo (ou o config.json), pelo mesmo
+    # `_dsp_cfg()` do DSP: assim a assinatura `resolve_device()` do Windows,
+    # que o supervisor e a suite chamam sem argumento, nao muda.
+    if cfg is None:
+        cfg = _dsp_cfg()
+    try:
+        want = str((cfg or {}).get("linux_mic_device") or "")
+    except Exception:
+        want = ""
+    idx, name, fallback = pick_linux_device(sd.query_devices(), want)
+    if want and fallback:
+        log.warning("linux_mic_device %r matched no input device; using %r", want, name)
+    return idx, name, fallback
+
+
+def resolve_device(timeout: float = -1.0, cfg=None):
     """Resolve o endpoint de captura. Devolve (indice_sounddevice, friendly_name, fallback).
 
     NUNCA usar sd.default.device: ele aponta para o clone MME de 90 ms. O casamento
@@ -463,6 +513,8 @@ def resolve_device(timeout: float = -1.0):
     with _portaudio(timeout) as got:
         if not got:
             raise RuntimeError("PortAudio ocupado (outra thread reabrindo o stream)")
+        if sys.platform != "win32":
+            return _resolve_linux(cfg)
         host = _wasapi_hostapi()
         name = default_comm_mic_name()
         if name:
@@ -521,7 +573,8 @@ class Mic:
     """
 
     def __init__(self, cfg=None, on_event=lambda *a, **k: None):
-        _require_com()                             # unico ponto que cobra comtypes
+        if sys.platform == "win32":
+            _require_com()                         # unico ponto que cobra comtypes
         self.cfg = cfg or config.load()
         self.on_event = on_event
 
@@ -649,6 +702,8 @@ class Mic:
     def _register_watcher(self):
         if self._watcher is not None or self._stop.is_set():
             return
+        if sys.platform != "win32":
+            return                                 # sem COM; o PipeWire segue o default sozinho
         if not _com_ready():
             # Sem MTA garantida a notificacao ou nao chega ou chega numa STA sem
             # bomba de mensagens; o supervisor de 0,5 s ainda pega a troca de headset.

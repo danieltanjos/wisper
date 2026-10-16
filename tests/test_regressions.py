@@ -71,6 +71,13 @@ for _p in (_os.path.dirname(_HERE), _HERE):
 
 import _safety  # noqa: E402  stubs antes de qualquer import de wispr
 
+# Testes que exercitam a camada Win32 POR DENTRO (struct do hook, SendInput,
+# integridade de token, %PATH% case-insensitive). No Linux `wispr.hotkey` e
+# `wispr.inject` sao os arquivos de wispr/linux/ (ver wispr/__init__.py), que
+# nao tem nada disso; o equivalente deles mora em tests/test_linux.py.
+_WIN = _sys.platform == "win32"
+_WIN_ONLY = "camada Win32 (no Linux o equivalente esta em tests/test_linux.py)"
+
 import contextlib
 import ctypes
 import inspect
@@ -622,6 +629,7 @@ class CancelDispatchTest(unittest.TestCase):
         self.drain(eng, ["stop"])
         self.assertEqual(fired, [])
 
+    @unittest.skipUnless(_WIN, _WIN_ONLY)
     def test_the_hook_gates_esc_on_cancellable_not_on_recording(self):
         # O hook proc nao pode ser chamado a mao (o lParam e' um ponteiro do SO),
         # entao a garantia fica no fonte: o Esc casa com `cancellable`.
@@ -899,6 +907,7 @@ class _Win32Elevation:
         return self
 
 
+@unittest.skipUnless(_WIN, _WIN_ONLY)
 @unittest.skipUnless(_app, _why_app or "wispr.app indisponivel")
 class ForegroundElevationIsRelativeTest(unittest.TestCase):
     """A pre-checagem local tem que ser RELATIVA, e nao "a janela e' de admin?".
@@ -934,6 +943,7 @@ class ForegroundElevationIsRelativeTest(unittest.TestCase):
         self.assertFalse(_app.foreground_is_elevated())
 
 
+@unittest.skipUnless(_WIN, _WIN_ONLY)
 class ElevatedEndToEndTest(_DeliverCase):
     """O cenario do defeito INTEIRO, sem dublar a pre-checagem do app: so a
     camada Win32 e' simulada, e as duas decisoes (a local e a do inject) rodam
@@ -1004,6 +1014,7 @@ class _BlobRecorder:
         return [n // 2 for n in self.calls]
 
 
+@unittest.skipUnless(_WIN, _WIN_ONLY)
 @unittest.skipUnless(_inject, _why_inject or "wispr.inject indisponivel")
 class PartialSendTest(unittest.TestCase):
     """O bloco 1 entrou e o 2 foi descartado: enquanto `.sent` era o do bloco que
@@ -1161,6 +1172,7 @@ class PartialInjectionIsNotPastedOverTest(_DeliverCase):
 # 8. transcricao vazia nunca vai para a area de transferencia
 # --------------------------------------------------------------------------- #
 
+@unittest.skipUnless(_WIN, _WIN_ONLY)
 @unittest.skipUnless(_inject, _why_inject or "wispr.inject indisponivel")
 class EmptyTranscriptInjectTest(unittest.TestCase):
     """Um ditado que virou so' um U+200B nao e' falha de entrega: e' texto que
@@ -1586,6 +1598,7 @@ class RepasteClearsTheFlagsTest(_AppCase):
 # os.add_dll_directory sozinho nao basta. Ver wispr/stt.py::_prepend_path.
 # --------------------------------------------------------------------------- #
 
+@unittest.skipUnless(_WIN, _WIN_ONLY)
 class CudaDllPathTest(unittest.TestCase):
     """O add_dll_directory so vale para quem chama LoadLibraryEx com
     LOAD_LIBRARY_SEARCH_USER_DIRS. O ctranslate2.dll usa LoadLibrary simples e
@@ -1703,6 +1716,7 @@ def _feed_hookproc(eng, vk, tag, down=True):
     return eng._hookproc(_hotkey.HC_ACTION, msg, ctypes.addressof(kb))
 
 
+@unittest.skipUnless(_WIN, _WIN_ONLY)
 @unittest.skipUnless(_hotkey, _why_hotkey or "wispr.hotkey indisponivel")
 class HookWatchdogProbeTest(unittest.TestCase):
     """O watchdog so' reinstala o hook depois que uma SONDA nao voltou.
@@ -2188,6 +2202,9 @@ class EngineAutoTest(unittest.TestCase):
         cfg = _config.load()
         cfg["engine"] = engine
         cfg["groq_api_key"] = key
+        # A escada testada aqui comeca na GPU. No Linux o padrao ja e'
+        # device=cpu (config.LINUX_DEFAULTS), entao a GPU e' pedida explicita.
+        cfg["device"] = "cuda"
         fake_fw = types.SimpleNamespace(WhisperModel=object, BatchedInferencePipeline=object)
 
         def load(_self, _wm, _bp, device, _ctype):

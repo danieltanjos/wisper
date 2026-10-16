@@ -181,11 +181,21 @@ def log_environment(log: logging.Logger | None = None) -> None:
                  config.MODELS_DIR, os.environ.get("HF_HOME"))
         log.info("assets: %s", config.ASSETS_DIR)
         log.info("logs: %s | crash: %s", LOG_FILE, CRASH_FILE)
-        log.info("mutex: %s", config.MUTEX_NAME)
-        log.info("com: ready=%s coinit_flags=%s error=%s",
-                 getattr(wispr, "COM_READY", None),
-                 getattr(sys, "coinit_flags", None),
-                 getattr(wispr, "COM_ERROR", None))
+        if sys.platform == "win32":
+            log.info("mutex: %s", config.MUTEX_NAME)
+            log.info("com: ready=%s coinit_flags=%s error=%s",
+                     getattr(wispr, "COM_READY", None),
+                     getattr(sys, "coinit_flags", None),
+                     getattr(wispr, "COM_ERROR", None))
+        else:
+            # Linux: instancia unica por flock, sem COM; a sessao diz se o
+            # kglobalaccel (KDE) e o fake_input (Wayland) podem existir aqui.
+            # Ver docs/LINUX.md.
+            log.info("lock: %s", getattr(config, "LOCK_PATH", "?"))
+            log.info("session: %s / %s | WAYLAND_DISPLAY=%s DISPLAY=%s",
+                     os.environ.get("XDG_SESSION_TYPE"),
+                     os.environ.get("XDG_CURRENT_DESKTOP"),
+                     os.environ.get("WAYLAND_DISPLAY"), os.environ.get("DISPLAY"))
     except Exception as exc:
         # Diagnostico nunca pode ser a causa de um crash - nem dentro do
         # proprio tratador: `log` pode ser um objeto quebrado do chamador.

@@ -13,6 +13,17 @@ A transcrição roda **local**, na sua RTX 4060 Ti, sem mandar áudio para lugar
 
 ---
 
+> **Linux (KDE Plasma 6, Wayland):** o mesmo app roda no Fedora com `Meta+A` / `Enter` / `Esc`,
+> transcrição na CPU (modelo `small`, int8) e o texto colado por Shift+Insert. Sem `sudo`:
+>
+> ```bash
+> ./scripts/setup.sh --download-model
+> ./scripts/run.sh --console
+> ./scripts/autostart_install.sh
+> ```
+>
+> Como funciona, o que foi medido e o que muda em relação ao Windows: [`docs/LINUX.md`](docs/LINUX.md).
+
 ## Por que isso NÃO usa a sua assinatura do ChatGPT Plus
 
 Você pediu para usar os tokens da conta Plus em vez de uma API key, e a resposta honesta é que

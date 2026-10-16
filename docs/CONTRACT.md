@@ -8,6 +8,12 @@ Ordem de import é crítica e está fixada em `wispr/__init__.py`. **Nunca** imp
 `sounddevice` antes de `comtypes`, e **nunca** importe `faster_whisper` antes de
 `wispr.stt._add_cuda_dll_dirs()` ter rodado.
 
+**Linux (docs/LINUX.md):** o contrato é o MESMO nas duas plataformas. No Linux,
+`wispr.hotkey` e `wispr.inject` são carregados de `wispr/linux/hotkey.py` e
+`wispr/linux/inject.py` pelo finder do `wispr/__init__.py`, com os mesmos nomes;
+os demais módulos são o mesmo arquivo com ramos `sys.platform`. As diferenças de
+comportamento que o integrador precisa saber estão marcadas com **Linux:** abaixo.
+
 ---
 
 ## `wispr/config.py` — pronto, não mexer
@@ -54,6 +60,13 @@ class HotkeyEngine:
 ```
 
 Callbacks são chamados na thread worker interna do engine, nunca no hook proc.
+
+**Linux:** o atalho vem do kglobalaccel do KDE (D-Bus). `recording` e
+`cancellable` são properties com os mesmos donos; escrever nelas registra ou solta
+Return/Escape no compositor (numa thread própria, nunca no lock de quem escreve).
+`alive` = o kglobalaccel ficou com alguma tecla para a ação `dictate` (o usuário
+pode tê-la trocado em Configurações do Sistema > Atalhos). `stop()` sempre solta
+Return/Escape, mesmo com `cancellable` ligada — sem engine não há quem ouça o sinal.
 
 `on_error(reason: str)` é opcional e **keyword-only**: o engine chama quando o
 hook para de instalar. Ele não tem timer de volta ao normal — quem mostra o erro
@@ -174,6 +187,16 @@ levanta. Ler por atributo, não por `isinstance(res, dict)`.
   para o clipboard deixaria o usuário com a área de transferência vazia e um
   aviso de erro que não aconteceu.
 
+**Linux:** `deliver()` devolve sempre `"paste"` (ou `"empty"`): clipboard
+(`wl-copy`) + atalho de colar (`linux_paste_keys`, Shift+Insert) pelo
+`org_kde_kwin_fake_input` do KWin. `chars` é o total quando o KWin aceitou as
+teclas e 0 quando não (sem fake_input liberado) — o app cai no clipboard. Não há
+entrega parcial nem UIPI: `target_elevated`/`blocked` são `False`.
+`type_unicode()` levanta `OSError` com `.sent = 0` (digitar não existe no
+Wayland sem root), e `tap()` recebe keycodes evdev, não virtual-keys.
+`Delivery` e `sanitize()` vêm de `wispr/delivery.py`, cópia fiel das do Windows
+(`tests/test_linux.py::DeliveryParityTest`).
+
 `type_unicode()` devolve as code units entregues e, quando falha, pendura a mesma
 contagem acumulada em `.sent` da `OSError`. `paste_text()` devolve
 `{"pasted": bool, "restored": bool, "lost_nontext_formats": bool}` e só levanta
@@ -197,6 +220,10 @@ A janela é `overrideredirect`, topmost, com transparentcolor, e recebe
 `WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE`. Ela **nunca**
 pode roubar o foco — se roubar, o texto é injetado na janela errada.
 
+**Linux:** a mesma classe, com Tk no XWayland: janela override-redirect, que o
+KWin não gerencia e que por isso nunca recebe foco. Sem `python3-tkinter` o
+`start()` degrada para no-op, como em qualquer falha de Tk.
+
 ## `wispr/tray.py`
 
 ```python
@@ -207,6 +234,11 @@ class Tray:
     def set_state(self, state: str) -> None   # "idle"|"recording"|"working"|"error"
     def notify(self, title: str, msg: str) -> None
 ```
+
+**Linux:** backend AppIndicator do pystray (StatusNotifierItem); o `run()` roda o
+loop do GTK na thread principal e roteia SIGTERM/SIGINT/SIGHUP pelo GLib (o handler
+Python do app não roda com o `Gtk.main()` segurando a thread). O menu é remontado
+quando algum texto muda, porque o AppIndicator não reavalia texto a cada abertura.
 
 `set_state()` aceita também os nomes da máquina de estados do app
 (`transcribing`, `injecting`, `loading`, `paused`, ...): a bandeja traduz.

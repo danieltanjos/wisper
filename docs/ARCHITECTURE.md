@@ -6,6 +6,9 @@ Clone do WisprFlow para Windows 11. Roda em segundo plano, `Win+A` começa a gra
 Tudo neste documento foi **medido nesta máquina** (Windows 11 Pro 26200, RTX 4060 Ti,
 Logitech PRO X, teclado US + ABNT2). Não é chute de documentação.
 
+O port para Linux (KDE Plasma 6 / Wayland / PipeWire, notebook sem NVIDIA) tem o
+próprio documento, medido do mesmo jeito: **`docs/LINUX.md`**. Nada abaixo mudou.
+
 ---
 
 ## 1. Decisão central: a assinatura ChatGPT Plus NÃO transcreve áudio

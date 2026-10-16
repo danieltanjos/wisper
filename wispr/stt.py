@@ -6,6 +6,10 @@ Dois backends: faster-whisper local na RTX 4060 Ti (padrao) e a API da Groq
 abaixo sao o resultado de um sweep medido nesta maquina, nao chute — ver
 docs/ARCHITECTURE.md secao 2. Nao "melhorar" sem medir de novo.
 
+No Linux (notebook sem NVIDIA) o config padrao ja pede `device="cpu"` com int8 e
+o modelo `small` (wispr/config.py, LINUX_DEFAULTS); nada de CUDA e nada de DLL:
+`_add_cuda_dll_dirs()` so' age no Windows.
+
 Importar este modulo e barato de proposito: `import faster_whisper` custa
 segundos, entao ele acontece dentro de Engine.__init__ e nao no topo do arquivo,
 para a bandeja subir antes de o modelo estar pronto.
@@ -520,6 +524,13 @@ class Engine:
             log.exception("model load failed on device=%s compute_type=%s; falling back",
                           device, ctype)
             if device == "cpu":
+                if engine == "auto" and groq_key(self.cfg):
+                    # device=cpu ja e' o pedido (o padrao no Linux, sem GPU): a
+                    # nuvem entra como reserva quando nem a CPU carrega — modelo
+                    # que nao baixou (sem rede no primeiro uso), disco cheio.
+                    log.info("engine=auto: cpu load failed, GROQ_API_KEY present -> groq")
+                    self._use_groq()
+                    return
                 raise TranscriptionError(
                     "Nao foi possivel carregar o modelo de transcricao. Veja o log.")
             if engine == "auto" and groq_key(self.cfg):

@@ -20,6 +20,13 @@ Threading (ver docs/ARCHITECTURE.md seção 6):
     threads daemon — inclusive o "Sair", que sem isso segurava o pump por até
     ~13 s de joins e locks com o ícone já removido da bandeja.
 
+Linux (KDE Plasma 6): o mesmo arquivo. O pystray usa o backend AppIndicator
+(typelib `AppIndicator3`, pacote libappindicator-gtk3), que fala
+StatusNotifierItem — o protocolo de bandeja do Plasma no Wayland — e roda o
+loop do GTK na thread principal. Por isso o venv do Linux tem
+`--system-site-packages`: o `gi` vem do Fedora. As diferenças de texto (motor
+"CPU", diagnóstico de injeção em vez de "elevado") estão em `_IS_WINDOWS`.
+
 Regra de lock: este módulo NUNCA chama o app segurando `self._lock`. O app
 chama `set_state()`/`notify()` de dentro das threads dele, e inverter essa
 ordem criaria um abraço mortal entre o lock do App e o lock da bandeja.
@@ -29,6 +36,8 @@ from __future__ import annotations
 import ctypes
 import functools
 import os
+import signal
+import sys
 import threading
 from pathlib import Path
 
@@ -90,7 +99,10 @@ _TIP_MAX = 120
 _NOTIFY_TITLE_MAX = 60
 _NOTIFY_MSG_MAX = 240
 
-_ENGINE_LABELS = {"local": "Local (GPU)", "groq": "Groq (nuvem)"}
+_IS_WINDOWS = sys.platform == "win32"
+# No Linux o motor local é a CPU (notebook sem NVIDIA, config.LINUX_DEFAULTS).
+_ENGINE_LABELS = {"local": "Local (GPU)" if _IS_WINDOWS else "Local (CPU)",
+                  "groq": "Groq (nuvem)"}
 
 
 # --------------------------------------------------------------------------- #
@@ -126,6 +138,9 @@ _KEY_NAMES = {
     "shift": "Shift", "esc": "Esc", "escape": "Esc", "enter": "Enter",
     "space": "Espaço", "tab": "Tab",
 }
+if not _IS_WINDOWS:
+    # A mesma tecla física; o KDE chama de Meta.
+    _KEY_NAMES.update({"win": "Meta", "super": "Meta", "meta": "Meta"})
 
 
 def _pretty_hotkey(spec) -> str:
@@ -250,6 +265,7 @@ class Tray:
         self._images = {}
         self._applied = (None, None)   # (estado, tooltip) já empurrados para o shell
         self._stopped = threading.Event()
+        self._menu_sig = None          # Linux: textos do menu já empurrados
 
     # ----------------------------------------------------------------- API --
     def run(self) -> None:
@@ -296,6 +312,8 @@ class Tray:
             return
 
         self.log.info("tray starting (state=%s)", self._state)
+        if not _IS_WINDOWS:
+            self._install_glib_signals()
         try:
             icon.run(setup=self._on_ready)
         except Exception:
@@ -392,9 +410,86 @@ class Tray:
                 # agora que o ícone existe de verdade no shell.
                 self._apply_state(force=True)
             self._refresh_menu()
+            if not _IS_WINDOWS:
+                self._start_linux_refresher()
             self.log.info("tray ready")
         except Exception:
             self.log.exception("tray setup failed")
+
+    # ------------------------------------------------- Linux: sinais --------
+    def _install_glib_signals(self) -> None:
+        """SIGTERM/SIGINT/SIGHUP pelo loop do GLib.
+
+        Medido no primeiro boot no Linux: com o `Gtk.main()` do pystray
+        segurando a thread principal, o handler Python do `App` NUNCA roda — o
+        `kill -TERM` ficou 20 s sem efeito (o C do Python so' marca a flag e
+        espera a thread principal voltar a executar bytecode). O
+        `GLib.unix_signal_add` entrega o sinal como evento do proprio loop. Faz
+        o mesmo que o "Sair" do menu: solta a bandeja e desliga numa thread.
+        """
+        try:
+            from gi.repository import GLib
+        except Exception:
+            self.log.debug("GLib unavailable; signals rely on the Python handler", exc_info=True)
+            return
+
+        def on_signal(signum):
+            self.log.info("signal %s received (GLib loop); shutting down", signum)
+            try:
+                self.stop()
+                self._spawn("shutdown", self.app.shutdown, "sinal %s" % signum)
+            except Exception:
+                self.log.exception("shutdown from signal failed")
+            return False      # GLib.SOURCE_REMOVE
+
+        for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                GLib.unix_signal_add(GLib.PRIORITY_HIGH, int(sig), on_signal, int(sig))
+            except Exception:
+                self.log.warning("could not route %s through GLib", name, exc_info=True)
+
+    # ------------------------------------------------- Linux: menu estático --
+    LINUX_REFRESH_S = 2.0
+
+    def _menu_signature(self):
+        """Tudo que o menu mostra e pode mudar sozinho. Cada leitura blindada."""
+        parts = []
+        for fn in (self._header_text, self._toggle_text, self._is_paused, self._engine,
+                   self._diag_mic, self._diag_stt, self._diag_elevated, self._diag_hook,
+                   lambda: bool(getattr(self.app, "last_text", "")),
+                   lambda: tuple(self._history()[:HISTORY_SLOTS])):
+            try:
+                parts.append(fn())
+            except Exception:
+                parts.append(None)
+        return tuple(parts)
+
+    def _start_linux_refresher(self) -> None:
+        """No Windows o pystray reavalia os textos do menu a cada abertura. O
+        backend AppIndicator monta o menu GTK UMA vez: sem isto o cabeçalho
+        ficava em "Carregando o modelo..." com o modelo pronto (visto no
+        primeiro boot no Linux). A cada LINUX_REFRESH_S reaplica o tooltip e,
+        SÓ quando algum texto mudou, remonta o menu — remontar fecha um menu
+        que esteja aberto, então nada de remontar à toa."""
+        def loop():
+            while not self._stopped.wait(self.LINUX_REFRESH_S):
+                try:
+                    self._apply_state()
+                    sig = self._menu_signature()
+                    if sig != self._menu_sig:
+                        self._menu_sig = sig
+                        self._refresh_menu()
+                except Exception:
+                    self.log.debug("tray refresh failed", exc_info=True)
+
+        try:
+            self._menu_sig = self._menu_signature()
+            threading.Thread(target=loop, name="tray-refresh", daemon=True).start()
+        except Exception:
+            self.log.exception("tray refresher did not start")
 
     def _apply_state(self, force: bool = False) -> None:
         """Empurra ícone e tooltip para o shell. Só quando mudou de verdade:
@@ -426,8 +521,10 @@ class Tray:
             self._applied = (state, tip)
 
     def _refresh_menu(self) -> None:
-        """Remonta o menu. Só é chamado de dentro de um callback de menu, ou
-        seja, já na thread do pystray."""
+        """Remonta o menu. No Windows só é chamado de dentro de um callback de
+        menu, ou seja, já na thread do pystray. No Linux também pela thread
+        tray-refresh: o `update_menu()` do backend GTK do pystray agenda o
+        trabalho no loop do GLib (decorador `mainloop`), então é seguro."""
         if self._stopped.is_set():
             return
         with self._lock:
@@ -718,6 +815,9 @@ class Tray:
     def _diag_mic(self) -> str:
         mic = self._component("mic", "audio", "microphone")
         name = getattr(mic, "name", None)
+        if not name and mic is not None and getattr(mic, "on_demand", False):
+            # Sob demanda o endpoint só é resolvido no primeiro ditado.
+            return "Microfone: abre no ditado"
         if not name:
             return "Microfone: não detectado"
         txt = "Microfone: %s" % _one_line(name, 38)
@@ -743,6 +843,8 @@ class Tray:
         return "STT: %s · %s" % (backend, _one_line(short, 30) or "?")
 
     def _diag_elevated(self) -> str:
+        if not _IS_WINDOWS:
+            return self._diag_inject()
         el = _is_elevated()
         if el is None:
             return "Elevado: desconhecido"
@@ -751,6 +853,22 @@ class Tray:
         # UIPI: com janela elevada em foco o hook recebe ZERO eventos e o Win+A
         # vaza para a Central de Ações. Só rodar elevado resolve (ARCHITECTURE §3).
         return "Elevado: não (falha sobre janelas admin)"
+
+    def _diag_inject(self) -> str:
+        """Linux: o fake_input do KWin está liberado para este processo?
+
+        Sem ele o texto fica só na área de transferência (o usuário cola com
+        Ctrl+V). `inject.status()` é cacheado e não manda tecla nenhuma.
+        """
+        try:
+            from wispr import inject
+            ok, _why = inject.status()
+        except Exception:
+            self.log.debug("inject.status() failed", exc_info=True)
+            return "Injeção: desconhecida"
+        if ok:
+            return "Injeção: colar automático"
+        return "Injeção: só clipboard (rode setup.sh)"
 
     def _diag_hook(self) -> str:
         alive, failed, installs = self._hook_health()
@@ -811,7 +929,7 @@ class Tray:
                  enabled=self._bool_prop(lambda: bool(getattr(self.app, "last_text", "")))),
             item("Histórico", menu(*self._history_items())),
             item("Motor", menu(
-                item("Local (GPU)", self._on_engine_local, radio=True,
+                item(_ENGINE_LABELS["local"], self._on_engine_local, radio=True,
                      checked=self._bool_prop(lambda: self._engine() != "groq", True)),
                 item("Groq (nuvem)", self._on_engine_groq, radio=True,
                      checked=self._bool_prop(lambda: self._engine() == "groq")),

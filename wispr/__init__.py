@@ -18,6 +18,10 @@ mesmo, entao setar a flag depois disso nao teria efeito nenhum.
 Importar o pacote precisa continuar barato: nada de `wispr.audio` ou
 `wispr.stt` aqui dentro.
 
+Fora do Windows nada disso roda (nao ha COM), e este arquivo ganha um segundo
+servico: o finder `_LinuxModuleFinder`, que faz `wispr.hotkey` e
+`wispr.inject` carregarem os arquivos de wispr/linux/. Ver docs/LINUX.md.
+
 COM_READY / COM_ERROR sao rebindados por `ensure_import_order()`. Leia sempre
 como atributo (`wispr.COM_READY`), nunca com `from wispr import COM_READY`, ou
 voce congela o valor de antes.
@@ -29,7 +33,7 @@ import sys
 __version__ = "1.0.0"
 
 __all__ = ["__version__", "COM_READY", "COM_ERROR", "RPC_E_CHANGED_MODE",
-           "ensure_import_order"]
+           "ensure_import_order", "LINUX_MODULES"]
 
 #: HRESULT de quem tentou mudar o apartment model depois do PortAudio.
 RPC_E_CHANGED_MODE = -2147417850
@@ -118,10 +122,55 @@ def ensure_import_order() -> None:
     COM_ERROR = "; ".join(problems) if problems else None
 
 
-try:
-    ensure_import_order()
-except Exception as _exc:  # pragma: no cover - cinto e suspensorio
-    # Nada aqui pode impedir `import wispr`: sem o pacote nao ha log, nao ha
-    # bandeja e o usuario nao ve absolutamente nada acontecer.
-    COM_READY = False
-    COM_ERROR = f"ensure_import_order crashed: {_exc!r}"
+# --------------------------------------------------------------------------- #
+# Linux: os modulos de plataforma moram em wispr/linux/
+# --------------------------------------------------------------------------- #
+#: `wispr.<nome>` -> arquivo em wispr/linux/ que o substitui fora do Windows.
+#: So os dois modulos do CONTRACT.md cujo MECANISMO nao existe fora do Windows
+#: (hook WH_KEYBOARD_LL; SendInput + clipboard Win32). audio, stt, overlay,
+#: tray e app sao os mesmos arquivos nas duas plataformas, com ramos
+#: `sys.platform` onde precisa. Ver docs/LINUX.md.
+LINUX_MODULES = {
+    "wispr.hotkey": "hotkey.py",
+    "wispr.inject": "inject.py",
+}
+
+
+class _LinuxModuleFinder:
+    """Carrega wispr/linux/<x>.py COM O NOME `wispr.<x>`.
+
+    O nome nao muda de proposito: `from wispr import inject` no app e na
+    bandeja, `load_pure("wispr.inject")` na suite, `mock.patch("wispr.inject.x")`
+    e o nome do logger (`wisper.inject`) continuam todos iguais nas duas
+    plataformas. Os arquivos Windows ficam intocados e simplesmente nao sao
+    lidos aqui. Lazy como qualquer import: nada e' carregado antes de alguem
+    pedir.
+    """
+
+    @staticmethod
+    def find_spec(fullname, path=None, target=None):
+        leaf = LINUX_MODULES.get(fullname)
+        if leaf is None:
+            return None
+        import importlib.util
+        import os
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "linux", leaf)
+        return importlib.util.spec_from_file_location(fullname, src)
+
+
+if sys.platform == "win32":
+    try:
+        ensure_import_order()
+    except Exception as _exc:  # pragma: no cover - cinto e suspensorio
+        # Nada aqui pode impedir `import wispr`: sem o pacote nao ha log, nao ha
+        # bandeja e o usuario nao ve absolutamente nada acontecer.
+        COM_READY = False
+        COM_ERROR = f"ensure_import_order crashed: {_exc!r}"
+else:
+    # Sem COM fora do Windows: nada de comtypes, nada de apartment. O PortAudio
+    # do Linux (ALSA -> PipeWire) nao tem ordem de import a respeitar.
+    _ordered = True
+    COM_ERROR = None
+    if not any(isinstance(f, _LinuxModuleFinder) or f is _LinuxModuleFinder
+               for f in sys.meta_path):
+        sys.meta_path.insert(0, _LinuxModuleFinder)

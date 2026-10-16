@@ -3,6 +3,10 @@
 Clone do WisprFlow para Windows 11. `Win+A` grava, `Enter` finaliza e digita o texto na janela
 em foco, `Esc` cancela. STT local com faster-whisper na GPU.
 
+**Também roda no Linux** (branch `feat/linux`, 2026-10-15): o notebook agora é Fedora 44 KDE
+Plasma 6 / Wayland, sem NVIDIA. `Meta+A` / `Enter` / `Esc`, `small` na CPU em int8. Tudo do port
+está em `docs/LINUX.md` — leia antes de mexer em `wispr/linux/`.
+
 **Estado: funciona de ponta a ponta, com um bug aberto (reticências).** O bring-up em hardware foi feito
 em 2026-09-17 na máquina original (Windows 11 Pro 26200, RTX 4060 Ti, Logitech PRO X).
 
@@ -21,6 +25,14 @@ documentação copiada. `docs/CONTRACT.md` tem a API entre os módulos.
    `.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"` (368 testes).
    `tests/_safety.py` transforma `SendInput`, `SetWindowsHookExW` e `OpenClipboard` em bomba de
    `RuntimeError`, então a suíte é segura mesmo com alguém jogando.
+   **No Linux:** `./tests/run_all.sh` (pytest; 391 passam, 44 pulam — os da camada Win32). A
+   trava lá bloqueia D-Bus de sessão, Wayland, `wl-copy`/`wl-paste` e `/dev/uinput`.
+   **Rodar o app no Linux registra `Meta+A` no kglobalaccel**, e durante um ditado também
+   `Return`/`Escape`: isso é sequestrar teclado, então vale a regra 1. Para testar o boot sem
+   roubar tecla, suba o `App` com `cfg["hotkey"] = "meta+ctrl+alt+shift+f21"` (tecla que não
+   existe no teclado) e dispare por `invokeShortcut` no D-Bus; depois
+   `./scripts/release-keys.sh --forget`, senão o kglobalaccel guarda o F21 e o `Meta+A` nunca
+   mais é registrado (sem `NoAutoloading`, a tecla salva vence o `config.json`).
 3. **Não lance o app de dentro de uma chamada de ferramenta comum** — o harness mata a árvore de
    processos quando a chamada termina, e o app morre junto sem deixar rastro. Use
    `run_in_background`. Isso já custou um ciclo de diagnóstico inteiro.
@@ -84,6 +96,44 @@ CPU. O `load=12,3 s` / `warm=1,42 s` desta rodada é cache de disco frio (os 2,5
 não regressão dos 3,0 s / 0,45 s. **Atenção ao ler o bench:** ele imprime **média ponderada**
 (4,5%); os 3,6% citados aqui são a média simples dos três fixtures — mesmo resultado, contas
 diferentes. Compare fixture a fixture.
+
+## Linux (notebook, Fedora 44 KDE Plasma 6.6.4, Wayland) — 2026-10-15
+
+Medido; detalhes e o porquê de cada escolha em `docs/LINUX.md`.
+
+- **Atalho:** kglobalaccel por D-Bus (jeepney). `Return`/`Escape` só existem como atalho global
+  enquanto `recording`/`cancellable` estão ligados. **O kglobalaccel mantém o atalho ativo depois
+  que o processo morre** (medido com F24), por isso há um guardião (`wispr/linux/keyguard.py`,
+  processo filho com pipe): `kill -9` no app real → componente inativo em < 2 s. Recuperação na
+  mão: `./scripts/release-keys.sh`.
+- **Injeção sem root:** `org_kde_kwin_fake_input` liberado por `.desktop` do usuário com
+  `X-KDE-Wayland-Interfaces` (o KWin casa o `Exec=` com o `/proc/<pid>/exe`). O setup copia o
+  Python para `.venv/bin/wisper` para a liberação valer só para o wisper. Texto vai por
+  `wl-copy` + Shift+Insert (keycodes físicos; nada de keysym, que perde acento no ABNT2). `wtype`
+  não serve (sem `zwp_virtual_keyboard_v1`); `ydotool` exigiria root.
+- **Boot:** sobe por `.venv/bin/wisper`, bandeja SNI (AppIndicator) com menu completo, modelo
+  `small` offline do cache em 5,3–5,6 s (warm 4,2–4,6 s). SIGTERM fecha em 0,4 s — **só depois**
+  de rotear os sinais pelo GLib: com o `Gtk.main()` na thread principal o handler Python nunca
+  rodava.
+- **STT na CPU (int8, `small`):** RTF 0,15–0,29; 12,3 s de fala → 1,9 s. WER 0,0% / 7,7% nos
+  fixtures limpos e 89% no `ptbr_dev1_noisy` (code-switching + ruído: o `small` desanda, como já
+  medido no Windows). Se não servir, `"engine": "groq"`.
+- **Primeiro ditado ao vivo (23:27):** `Meta+A` → fala → `Enter` gravou e transcreveu certo
+  (`'Teste de gravação para ver se está funcionando.'`, 3 s de áudio → 1,6 s), mas entregou
+  **0 chars**: o `wl-copy` deixa um filho servindo a seleção que herda o stderr, e com
+  `stderr=PIPE` o `run()` esperava um EOF que nunca vem (timeout de 3 s, sempre). Corrigido:
+  stderr num arquivo temporário (`ClipboardSetTextTest`, remutado). **Confirmado ao vivo (23:31):**
+  `'Testes de transcrição?'` colado no Konsole, `chars=22/22 mode=paste`, transcribe 1,6 s +
+  inject 0,9 s.
+- **O notebook roda com `"engine": "groq"` no `config.json` (2026-10-15).** No Windows ele já
+  usava a Groq sem config nenhum: a CUDA falhava e o `engine: auto` caía para a nuvem. No Linux o
+  padrão `device: cpu` nunca tenta CUDA, então o `auto` ficava no `small` local. Mesmos 3 wavs de
+  `logs/recordings/`: local 1,46 / 1,91 / 4,42 s para 2,7 / 13,6 / 60 s de áudio; Groq 0,72 /
+  0,57 / 0,97 s, e acertando o que o `small` erra ("comitinhos", "CloudWatch e ico 10").
+  Sem rede não há ditado (igual ao Windows deste notebook).
+- **Não medido (precisa do usuário):** apertar `Meta+A`/`Enter`/`Esc` de verdade, abrir o microfone
+  (só a enumeração foi feita: device `pipewire`), colar numa janela real, e a pílula (falta
+  `sudo dnf install python3-tkinter`).
 
 ## O que está provado em hardware
 
